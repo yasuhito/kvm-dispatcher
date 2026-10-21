@@ -755,7 +755,9 @@ process.exit(failed ? 1 : 0);
 
 # Verify the unit together with its isolation drop-in in a disposable systemd root.
 VERIFY_ROOT="$TMP_DIR/systemd-root"
-mkdir -p "$VERIFY_ROOT/etc/systemd/system/kvm-dispatcher.service.d" "$VERIFY_ROOT/opt/kvm-dispatcher/host"
+mkdir -p "$VERIFY_ROOT/etc/systemd/system/kvm-dispatcher.service.d" "$VERIFY_ROOT/opt/kvm-dispatcher/host" "$VERIFY_ROOT/usr/lib/systemd"
+# systemd 255 resolves default dependencies such as sysinit.target only inside --root.
+cp -a /usr/lib/systemd/system "$VERIFY_ROOT/usr/lib/systemd/"
 cp "$ROOT_DIR/host/systemd/kvm-dispatcher.service" "$VERIFY_ROOT/etc/systemd/system/kvm-dispatcher.service"
 cp "$ROOT_DIR/host/systemd/kvm-dispatcher.service.d/10-isolation.conf" "$VERIFY_ROOT/etc/systemd/system/kvm-dispatcher.service.d/10-isolation.conf"
 cp "$ROOT_DIR/host/kvm_dispatcher.sh" "$ROOT_DIR/host/kvm_dispatcher_lib.sh" "$VERIFY_ROOT/opt/kvm-dispatcher/host/"
