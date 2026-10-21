@@ -8,7 +8,8 @@ The initial Beelink policy is one 12 GiB guest at a time. It samples each job un
 
 - `host/kvm_dispatcher.sh`: polling, scheduling, and in-flight monitoring loop.
 - `host/kvm_dispatcher_lib.sh`: trusted shell config loading, GitHub App JWT and installation-token handling, job state, and status output.
-- `host/kvm_dispatcher_host_wizard.sh`: encrypts a GitHub App PEM supplied through hidden terminal stdin. It does not enable or start the service.
+- `host/kvm_dispatcher_install_wizard.sh`: the root-only, staged core-install entry point. It installs files, applies sysusers/tmpfiles and group membership, invokes the PEM wizard, and runs the no-adapter probe without enabling or starting the service.
+- `host/kvm_dispatcher_host_wizard.sh`: the PEM stage used by the install wizard. It encrypts a GitHub App PEM supplied through hidden terminal stdin and refuses to overwrite an existing credential.
 - `host/systemd/`: service, isolation drop-in, sysusers, and tmpfiles configuration.
 - `host/systemd/examples/`: the `20-job-runtime.conf` drop-ins that the QA2 and Qoral job templates need.
 - `host/polkit/50-kvm-dispatcher.rules`: narrow authorization for starting and stopping only supported job templates.
@@ -53,16 +54,46 @@ Restrict each installation to only the repository it serves. The example IDs in 
 
 The service receives the PEM only as `LoadCredentialEncrypted=app-key:...`. It signs short-lived RS256 JWTs with `openssl dgst -sha256 -sign` and exchanges them for installation tokens. Tokens are cached per installation and refreshed with less than ten minutes remaining. GitHub requests put authentication in curl's config stream on stdin, not in curl arguments. Job token copies are refreshed while their units remain active by writing a temporary file with the same group and 0640 mode and renaming it into place, which lets a Qoral adapter that uses an indirect host token path keep cleanup working after a long job. The token is not copied into the guest.
 
-Run the host wizard from a root-controlled terminal. Confirm the displayed action, paste the PEM with terminal echo disabled, and press Ctrl-D. `systemd-creds encrypt` consumes it on stdin; the wizard installs only the encrypted credential, writes an audit event to the journal, and leaves service activation to the operator.
+Run `host/kvm_dispatcher_install_wizard.sh` from the root of a clean checkout in a root-controlled terminal. It prints the checkout HEAD and asks for confirmation separately before each stage. The PEM stage invokes `host/kvm_dispatcher_host_wizard.sh`; paste the PEM with terminal echo disabled and press Ctrl-D. `systemd-creds encrypt` consumes it on stdin, and only the encrypted credential is installed. Each stage writes an audit event to the journal. The install and verification stages never enable or start `kvm-dispatcher.service`.
 
 ## Configuration and adding a repository
 
-1. Install the host scripts under `/opt/kvm-dispatcher/host/`, the service and drop-in under `/etc/systemd/system/`, and the polkit rule under `/etc/polkit-1/rules.d/`.
-2. Install `kvm-dispatcher.sysusers.conf` and `kvm-dispatcher.tmpfiles.conf` into the systemd sysusers and tmpfiles configuration directories. Run `systemd-sysusers` and `systemd-tmpfiles --create`. Once an adapter's job user exists, add the dispatcher to that adapter's job group, for example `usermod -aG qa2-runner-host kvm-dispatcher` and `usermod -aG qoral-runner-host kvm-dispatcher`. This is not done in sysusers because a membership line would create the group before the adapter's own sysusers file creates its user. The dispatcher checks its membership at startup and refuses to start without it.
-3. Copy `host/dispatcher.conf.example` to `/etc/kvm-dispatcher/dispatcher.conf`, set the App and installation IDs, and keep the file root-owned and readable by the `kvm-dispatcher` group. Use the wizard to install `app-key.cred`.
-4. For every repository, install its adapter file in `/etc/kvm-dispatcher/repos.d/<name>.conf` and its own template unit `<adapter-unit>@.service`. The dispatcher reads adapter files at startup, so restart it after adding or changing adapters. Startup resync adopts running job units. Verify the installation before enabling the dispatcher.
+### Core installation and verification
 
-A repository joins by shipping those two files:
+On Beelink, obtain the reviewed source revision in a new checkout. Pin it to the commit approved for installation, then run the single install wizard from the checkout root:
+
+```sh
+mkdir -p "$HOME/src"
+git clone --branch main --single-branch https://github.com/yasuhito/kvm-dispatcher "$HOME/src/kvm-dispatcher"
+git -C "$HOME/src/kvm-dispatcher" checkout --detach <approved-commit>
+```
+
+From that checkout's root, run:
+
+```sh
+sudo ./host/kvm_dispatcher_install_wizard.sh
+```
+
+The wizard refuses a dirty checkout, prints the HEAD commit for confirmation, and asks before every stage: preflight, core-file placement, identity/configuration, hidden PEM entry, and the no-adapter verification probe. It can run one stage again with `--stage preflight|install|identity|pem|verify`; identical files are skipped and differing files are never overwritten. `--rollback` implements the pre-adapter rollback and refuses to proceed if `repos.d` is non-empty. Do not run `--rollback` after installing adapters. The wizard never creates the QA2 or Qoral job groups and never enables or starts `kvm-dispatcher.service`.
+
+`KVM_DISPATCHER_INSTALL_ROOT` is reserved for tests that place files in a temporary fake root. With it set, only `--stage install` is allowed; it does not invoke system-changing commands or provide a way to install into the live host.
+
+The file-placement table is retained as a reference for manual inspection. The wizard checks every listed path, skips a matching file with the expected owner and mode, and refuses a differing file.
+
+| Checkout source | Destination | Owner:group | Mode |
+|---|---|---|---:|
+| `host/kvm_dispatcher.sh` | `/opt/kvm-dispatcher/host/kvm_dispatcher.sh` | `root:root` | `0755` |
+| `host/kvm_dispatcher_lib.sh` | `/opt/kvm-dispatcher/host/kvm_dispatcher_lib.sh` | `root:root` | `0644` |
+| `host/kvm_dispatcher_host_wizard.sh` | `/opt/kvm-dispatcher/host/kvm_dispatcher_host_wizard.sh` | `root:root` | `0755` |
+| `host/systemd/kvm-dispatcher.service` | `/etc/systemd/system/kvm-dispatcher.service` | `root:root` | `0644` |
+| `host/systemd/kvm-dispatcher.service.d/10-isolation.conf` | `/etc/systemd/system/kvm-dispatcher.service.d/10-isolation.conf` | `root:root` | `0644` |
+| `host/polkit/50-kvm-dispatcher.rules` | `/etc/polkit-1/rules.d/50-kvm-dispatcher.rules` | `root:root` | `0644` |
+| `host/systemd/kvm-dispatcher.sysusers.conf` | `/etc/sysusers.d/kvm-dispatcher.conf` | `root:root` | `0644` |
+| `host/systemd/kvm-dispatcher.tmpfiles.conf` | `/etc/tmpfiles.d/kvm-dispatcher.conf` | `root:root` | `0644` |
+| `host/dispatcher.conf.example` | `/etc/kvm-dispatcher/dispatcher.conf` | `root:kvm-dispatcher` | `0640` |
+| wizard output (no plaintext file) | `/etc/kvm-dispatcher/app-key.cred` | `root:root` | `0600` |
+
+The test script and adapter examples are not installed by the core wizard. After the no-adapter probe passes, a repository joins by shipping its adapter config and unit:
 
 - Its adapter config sets `KVM_DISPATCHER_REPO`, `KVM_DISPATCHER_INSTALLATION`, `KVM_DISPATCHER_LABELS`, `KVM_DISPATCHER_UNIT`, `KVM_DISPATCHER_RUNNER_NAME_PREFIX`, `KVM_DISPATCHER_MAX_UNIT_SECONDS`, `KVM_DISPATCHER_MEMORY_MIB`, `KVM_DISPATCHER_CONCURRENCY`, and `KVM_DISPATCHER_JOB_GROUP` (the primary group of its job template's `User=`). See the QA2 and Qoral examples in `host/repos.d/`.
 - Its `Restart=no` template unit runs the existing one-job script, loads the token with `LoadCredential=github-token:/run/kvm-dispatcher/jobs/%i/github-token`, and sets `MemoryAccounting=yes` so per-job peak usage is available. Do not add an idle restart loop. The unit must not require `github-token.cred`, since the dispatcher supplies the credential per job.
@@ -115,6 +146,6 @@ Journal events include:
 
 ## Migration and rollback
 
-For the planned QA2 and Qoral move, install the dispatcher with no adapters first and verify App-token access. Add the QA2 template and adapter, then switch only while QA2 is idle: confirm its runner is not busy, stop and disable `qa2-runner.service`, and let the dispatcher claim the queued work. Add Qoral only after QA2 is running under dispatch. Keep the legacy unit files installed but disabled while either repository's preflight still checks them. Do not create a Qoral PAT.
+For the planned QA2 and Qoral move, install the dispatcher with no adapters first and verify App-token access. Before adding any adapter, `sudo ./host/kvm_dispatcher_install_wizard.sh --rollback` removes the core installation; it refuses to proceed if `repos.d` contains any entry and never changes either legacy runner service. Add the QA2 template and adapter, then switch only while QA2 is idle: confirm its runner is not busy, stop and disable `qa2-runner.service`, and let the dispatcher claim the queued work. Add Qoral only after QA2 is running under dispatch. Keep the legacy unit files installed but disabled while either repository's preflight still checks them. Do not create a Qoral PAT.
 
-To roll back, stop and disable `kvm-dispatcher.service`, remove the affected adapter config, and re-enable the corresponding legacy runner service. Restore the legacy service's credential and configuration first if they were removed. Existing GitHub jobs remain queued unless a job had already been claimed; stop any active job template before re-enabling the legacy service.
+After adapters are installed, the pre-adapter wizard rollback is no longer appropriate. To roll back a migration, stop and disable `kvm-dispatcher.service`, remove the affected adapter config, and re-enable the corresponding legacy runner service. Restore the legacy service's credential and configuration first if they were removed. Existing GitHub jobs remain queued unless a job had already been claimed; stop any active job template before re-enabling the legacy service.
