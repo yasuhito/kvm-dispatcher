@@ -41,13 +41,17 @@ printf '%s\n' \
     'The PEM is entered with terminal echo disabled and passed only on stdin to systemd-creds.' \
     'No service is enabled or started by this wizard.' \
     '' \
-    'Afterward, configure dispatcher.conf and repos.d, install the supplied unit and polkit rule,' \
-    'then verify the installations before starting the dispatcher.' >/dev/tty
+    'This PEM stage installs only the encrypted credential. Return to the install wizard' \
+    'to verify both installations before adding adapters or enabling the dispatcher.' >/dev/tty
 printf 'Continue? [y/N] ' >/dev/tty
 IFS= read -r answer </dev/tty
 [[ $answer == y || $answer == Y ]] || { printf 'Cancelled.\n' >/dev/tty; exit 1; }
 
 getent group kvm-dispatcher >/dev/null || { printf 'Install kvm-dispatcher.sysusers.conf before running this wizard.\n' >&2; exit 1; }
+if [[ -e $CREDENTIAL_FILE || -L $CREDENTIAL_FILE ]]; then
+    printf 'Refusing to overwrite an existing encrypted credential: %s\n' "$CREDENTIAL_FILE" >&2
+    exit 1
+fi
 install -d -o root -g kvm-dispatcher -m 0750 "$CREDENTIAL_DIR"
 tmp_dir=$(mktemp -d "$CREDENTIAL_DIR/.app-key-wizard.XXXXXX")
 chmod 0700 "$tmp_dir"
@@ -66,11 +70,4 @@ fi
 
 install -o root -g root -m 0600 "$tmp_dir/app-key.cred" "$CREDENTIAL_FILE"
 logger --tag kvm-dispatcher-host-wizard "event=app-key-encrypted path=$CREDENTIAL_FILE"
-printf 'Encrypted App key installed. Configure the dispatcher and verify the App permissions before enabling it.\n' >/dev/tty
-printf '%s\n' \
-    '' \
-    'Each job token is readable only by its adapter job group (KVM_DISPATCHER_JOB_GROUP).' \
-    'After the QA2 and Qoral job users exist, add the dispatcher to each job group:' \
-    '  usermod -aG qa2-runner-host kvm-dispatcher' \
-    '  usermod -aG qoral-runner-host kvm-dispatcher' \
-    'The dispatcher refuses to start while it is not a member of an adapter job group.' >/dev/tty
+printf 'Encrypted App key installed. Continue with no-adapter verification before adding adapters.\n' >/dev/tty

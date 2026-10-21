@@ -799,8 +799,74 @@ for template in qa2 qoral; do
         fail "$template job RuntimeDirectoryMode is not 0700"
 done
 
+# Exercise install-stage placement, repeatability, and collision refusal without root
+# or touching host paths. The fake root permits no system-changing stage.
+WIZARD_TEST_BIN="$TMP_DIR/install-wizard-bin"
+WIZARD_TEST_ROOT="$TMP_DIR/install-wizard-root"
+WIZARD_TEST_AUDIT="$TMP_DIR/install-wizard-audit.log"
+mkdir -p "$WIZARD_TEST_BIN" "$WIZARD_TEST_ROOT"
+for command_name in systemctl systemd-run systemd-creds systemd-sysusers systemd-tmpfiles pkaction usermod; do
+    cat > "$WIZARD_TEST_BIN/$command_name" <<'FAKE_SYSTEM_COMMAND'
+#!/usr/bin/env bash
+printf '%s\n' "unexpected system command: $0 $*" >> "$WIZARD_TEST_AUDIT"
+exit 99
+FAKE_SYSTEM_COMMAND
+    chmod +x "$WIZARD_TEST_BIN/$command_name"
+done
+cat > "$WIZARD_TEST_BIN/getent" <<'FAKE_GETENT'
+#!/usr/bin/env bash
+if [[ ${1:-} == group ]]; then
+    case ${2:-} in
+        qa2-runner-host) printf 'qa2-runner-host:x:943:\n'; exit 0 ;;
+        qoral-runner-host) printf 'qoral-runner-host:x:939:\n'; exit 0 ;;
+    esac
+fi
+exit 2
+FAKE_GETENT
+chmod +x "$WIZARD_TEST_BIN/getent"
+export WIZARD_TEST_AUDIT
+export PATH="$WIZARD_TEST_BIN:$PATH"
+WIZARD_INSTALLER="$ROOT_DIR/host/kvm_dispatcher_install_wizard.sh"
+run_fake_install_stage() {
+    (cd "$ROOT_DIR" && KVM_DISPATCHER_INSTALL_ROOT="$WIZARD_TEST_ROOT" "$WIZARD_INSTALLER" --stage install) > "$TMP_DIR/install-wizard.out" 2>&1
+}
+run_fake_install_stage || {
+    printf '%s\n' 'install wizard fake-root output:' >&2
+    printf '%s\n' "$(<"$TMP_DIR/install-wizard.out")" >&2
+    fail 'install wizard fake-root placement failed'
+}
+for destination in \
+    /opt/kvm-dispatcher/host/kvm_dispatcher.sh \
+    /opt/kvm-dispatcher/host/kvm_dispatcher_lib.sh \
+    /opt/kvm-dispatcher/host/kvm_dispatcher_host_wizard.sh \
+    /etc/systemd/system/kvm-dispatcher.service \
+    /etc/systemd/system/kvm-dispatcher.service.d/10-isolation.conf \
+    /etc/polkit-1/rules.d/50-kvm-dispatcher.rules \
+    /etc/sysusers.d/kvm-dispatcher.conf \
+    /etc/tmpfiles.d/kvm-dispatcher.conf; do
+    [[ -f $WIZARD_TEST_ROOT$destination ]] || fail "install wizard missed $destination"
+done
+cmp -s "$ROOT_DIR/host/kvm_dispatcher.sh" "$WIZARD_TEST_ROOT/opt/kvm-dispatcher/host/kvm_dispatcher.sh" || fail 'install wizard copied unexpected dispatcher content'
+[[ $(stat -c %a "$WIZARD_TEST_ROOT/opt/kvm-dispatcher/host/kvm_dispatcher.sh") == 755 ]] || fail 'install wizard did not preserve the dispatcher executable mode'
+[[ -s $WIZARD_TEST_ROOT/var/log/kvm-dispatcher-install-wizard.audit ]] || fail 'fake-root install stage did not record audit events'
+[[ ! -s $WIZARD_TEST_AUDIT ]] || fail 'fake-root install stage invoked a system-changing command'
+
+installed_mtime=$(stat -c %y "$WIZARD_TEST_ROOT/opt/kvm-dispatcher/host/kvm_dispatcher.sh")
+run_fake_install_stage || fail 'identical install stage could not be rerun'
+[[ $(stat -c %y "$WIZARD_TEST_ROOT/opt/kvm-dispatcher/host/kvm_dispatcher.sh") == "$installed_mtime" ]] || fail 'identical install stage rewrote an unchanged destination'
+grep -Fq 'skipped identical file: /opt/kvm-dispatcher/host/kvm_dispatcher.sh' "$TMP_DIR/install-wizard.out" || fail 'identical install stage did not report its skip'
+
+printf 'modified destination\n' > "$WIZARD_TEST_ROOT/opt/kvm-dispatcher/host/kvm_dispatcher.sh"
+chmod 755 "$WIZARD_TEST_ROOT/opt/kvm-dispatcher/host/kvm_dispatcher.sh"
+if run_fake_install_stage; then
+    fail 'install wizard overwrote a differing destination'
+fi
+grep -Fq 'It will not be overwritten' "$TMP_DIR/install-wizard.out" || fail 'install wizard did not explain collision refusal'
+[[ $(<"$WIZARD_TEST_ROOT/opt/kvm-dispatcher/host/kvm_dispatcher.sh") == 'modified destination' ]] || fail 'install wizard changed the conflicting destination'
+
 while IFS= read -r -d '' script; do
     bash -n "$ROOT_DIR/$script"
 done < <(git -C "$ROOT_DIR" ls-files -z '*.sh')
+bash -n "$WIZARD_INSTALLER"
 (cd "$ROOT_DIR" && shellcheck -x host/*.sh)
 printf 'PASS: dispatcher host tests\n'
