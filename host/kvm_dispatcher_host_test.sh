@@ -353,7 +353,7 @@ assert_contains "$(<"$FAKE_START_LOG")" 'qoral-runner-job@2001.service'
 [[ $(wc -l < "$FAKE_START_LOG") -eq 1 ]] || fail 'capacity semaphore started more than one 12 GiB job'
 [[ $(jq '.queued | length' "$TMP_DIR/status/status.json") -eq 1 ]] || fail 'queued status did not separate the in-flight job from waiting jobs'
 [[ $(jq '.in_flight | length' "$TMP_DIR/status/status.json") -eq 1 ]] || fail 'status did not include the running job'
-jq -e 'keys == ["blocked","capacity_mib","in_flight","last_poll","queued","updated_at"] and .capacity_mib == 12288 and (.in_flight|type == "array") and (.queued|type == "array") and (.last_poll|type == "object") and (.blocked|type == "array")' "$TMP_DIR/status/status.json" >/dev/null || fail 'status.json shape is incorrect'
+jq -e 'keys == ["blocked","capacity_mib","in_flight","last_poll","queued","recent","updated_at"] and .capacity_mib == 12288 and (.in_flight|type == "array") and (.queued|type == "array") and (.last_poll|type == "object") and (.blocked|type == "array") and .recent == []' "$TMP_DIR/status/status.json" >/dev/null || fail 'status.json shape is incorrect'
 
 # Each job token is readable only through its own adapter's job group: a QA2 job user
 # cannot read a Qoral token, and a Qoral job user cannot read a QA2 token.
@@ -534,14 +534,34 @@ add_job_state qa2 qniapp/qa2 1010 qa2-runner-job@1010.service "$((BASE_NOW - 90)
 printf '%s\n' 'qa2-runner-job@1010.service' > "$FAKE_SYSTEMCTL_ACTIVE"
 set_runs qniapp_qa2 queued '[{"id":105}]'
 set_jobs qniapp_qa2 105 '[{"id":1010,"status":"queued","created_at":"2026-01-01T00:00:01Z","labels":["qa2-kvm"]}]'
+FAKE_MEMORY_PEAK='[not set]' run_dispatcher
+jq -e '.in_flight == [{"repo":"qniapp/qa2","job_id":"1010","unit":"qa2-runner-job@1010.service","since":"2026-01-01T00:00:00Z","memory_peak_mib":null}]' "$TMP_DIR/status/status.json" >/dev/null || fail 'in-flight memory_peak_mib is not null before any sample'
 run_dispatcher
+jq -e '.in_flight[0].memory_peak_mib == 12' "$TMP_DIR/status/status.json" >/dev/null || fail 'in-flight status does not report the sampled memory peak'
 FAKE_MEMORY_PEAK=1048576 run_dispatcher
 : > "$FAKE_SYSTEMCTL_ACTIVE"
 run_dispatcher
 assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-finished unit=qa2-runner-job@1010.service exit=0 duration=90s memory_peak_mib=12'
+jq -e '.in_flight == [] and .recent == [{"repo":"qniapp/qa2","job_id":"1010","unit":"qa2-runner-job@1010.service","outcome":"done","started_at":"2025-12-31T23:58:30Z","finished_at":"2026-01-01T00:00:00Z","duration_s":90,"memory_peak_mib":12,"exit_status":0}]' "$TMP_DIR/status/status.json" >/dev/null || fail 'finished job is missing from recent status history'
 [[ ! -s $FAKE_START_LOG ]] || fail 'dispatcher relaunched a job ID after its runner unit had already run'
 jq -e '.blocked | any(.[]; .job_id == "1010" and .reason == "unit-already-ran")' "$TMP_DIR/status/status.json" >/dev/null || fail 'consumed queued job was not exposed as blocked'
 assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-attribution-unknown repo=qniapp/qa2 job=1010'
+
+# The recent history keeps only the newest 20 finished jobs, newest first, and survives
+# a dispatcher restart that loses the runtime job state.
+clear_fixtures
+source "$ROOT_DIR/host/kvm_dispatcher_lib.sh"
+kvd_load_config
+for job_id in $(seq 3001 3021); do
+    add_job_state qa2 qniapp/qa2 "$job_id" "qa2-runner-job@$job_id.service" "$BASE_NOW" 5400
+    : > "$FAKE_SYSTEMCTL_ACTIVE"
+    FAKE_EXEC_MAIN_STATUS=- KVM_DISPATCHER_TEST_NOW=$((BASE_NOW + job_id - 3000)) kvd_record_job_finished "$job_id" stuck > /dev/null
+done
+rm -rf "$TMP_DIR/state"
+mkdir -p "$TMP_DIR/state"
+run_dispatcher
+jq -e '.recent | length == 20 and ([.[].job_id] == ([range(3021; 3001; -1)] | map(tostring)))' "$TMP_DIR/status/status.json" >/dev/null || fail 'recent history is not the newest 20 jobs, newest first, after a restart'
+jq -e '.recent[0] == {"repo":"qniapp/qa2","job_id":"3021","unit":"qa2-runner-job@3021.service","outcome":"stuck","started_at":"2026-01-01T00:00:00Z","finished_at":"2026-01-01T00:00:21Z","duration_s":21,"memory_peak_mib":null,"exit_status":null}' "$TMP_DIR/status/status.json" >/dev/null || fail 'recent entry with an unknown exit status and memory peak is not null'
 
 # The runner started for job X took the newer job Y. X was not run, so it is not consumed:
 # it counts as a start failure, returns after 300 seconds, and a worker that never runs
@@ -758,6 +778,8 @@ for template in qa2 qoral; do
         fail "$template job RuntimeDirectoryMode is not 0700"
 done
 
-bash -n "$ROOT_DIR/host/kvm_dispatcher.sh" "$ROOT_DIR/host/kvm_dispatcher_lib.sh" "$ROOT_DIR/host/kvm_dispatcher_host_wizard.sh"
-shellcheck -x "$ROOT_DIR/host/kvm_dispatcher.sh" "$ROOT_DIR/host/kvm_dispatcher_lib.sh" "$ROOT_DIR/host/kvm_dispatcher_host_wizard.sh" "$ROOT_DIR/host/kvm_dispatcher_host_test.sh"
+while IFS= read -r -d '' script; do
+    bash -n "$ROOT_DIR/$script"
+done < <(git -C "$ROOT_DIR" ls-files -z '*.sh')
+(cd "$ROOT_DIR" && shellcheck -x host/*.sh)
 printf 'PASS: dispatcher host tests\n'

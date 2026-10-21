@@ -87,12 +87,15 @@ jq . /var/lib/kvm-dispatcher/status.json
 {
   "updated_at": "2026-01-01T00:00:00Z",
   "capacity_mib": 12288,
-  "in_flight": [{"repo":"qniapp/qa2","job_id":"123","unit":"qa2-runner-job@123.service","since":"2026-01-01T00:00:00Z"}],
+  "in_flight": [{"repo":"qniapp/qa2","job_id":"123","unit":"qa2-runner-job@123.service","since":"2026-01-01T00:00:00Z","memory_peak_mib":10240}],
   "queued": [{"repo":"qorraq/qoral","job_id":"456","created_at":"2026-01-01T00:00:20Z"}],
   "last_poll": {"qniapp/qa2":{"http":"200","at":"2026-01-01T00:00:00Z"}},
-  "blocked": [{"repo":"qniapp/qa2","job_id":"789","attempts":3,"reason":"start-failures"}]
+  "blocked": [{"repo":"qniapp/qa2","job_id":"789","attempts":3,"reason":"start-failures"}],
+  "recent": [{"repo":"qorraq/qoral","job_id":"455","unit":"qoral-runner-job@455.service","outcome":"done","started_at":"2025-12-31T22:00:00Z","finished_at":"2025-12-31T23:30:00Z","duration_s":5400,"memory_peak_mib":11800,"exit_status":0}]
 }
 ```
+
+`memory_peak_mib` is the largest cgroup `memory.peak` sampled so far, in MiB, or `null` before any sample. `recent` holds the newest 20 finished jobs, newest first, with `outcome` `done`, `cancelled`, or `stuck`; `exit_status` is `null` when systemd did not report one. The history is kept in `/var/lib/kvm-dispatcher/recent.json`, so it survives dispatcher restarts and reboots.
 
 The `queued` list omits jobs already claimed by a unit. `in_flight` includes only active units. A three-strike start failure can be retried by removing its JSON record from `/var/lib/kvm-dispatcher/attempts/` after investigating the failure. A `unit-already-ran` record means a worker unit ran that job, or its runner could not be attributed, while GitHub still reports the job queued; the dispatcher will not start the same job ID again, so rerun the workflow or remove that record only after investigating.
 

@@ -25,16 +25,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes jq shellcheck
 
-      - name: Check Bash syntax
-        shell: bash
-        run: |
-          set -o errexit -o nounset -o pipefail
-          while IFS= read -r -d '' script; do
-            bash -n "$script"
-          done < <(find . -type f -name '*.sh' -not -path './.git/*' -print0)
-
-      - name: Run ShellCheck
-        run: shellcheck -x host/*.sh
-
-      - name: Run host tests, systemd verification, and polkit checks
+      - name: Run host tests, shell checks, systemd verification, and polkit checks
         run: host/kvm_dispatcher_host_test.sh

@@ -78,6 +78,7 @@ kvd_load_config() {
     KVD_STATUS_FILE=$KVM_DISPATCHER_STATUS_FILE
     KVD_STATUS_DIR=$(dirname "$KVD_STATUS_FILE")
     KVD_ATTEMPT_DIR="$KVD_STATUS_DIR/attempts"
+    KVD_RECENT_FILE="$KVD_STATUS_DIR/recent.json"
     KVD_REPOS_DIR=$KVM_DISPATCHER_REPOS_DIR
     KVD_CAPACITY_MIB=$KVM_DISPATCHER_CAPACITY_MIB
     KVD_POLL_SECONDS=$KVM_DISPATCHER_POLL_SECONDS
@@ -722,7 +723,7 @@ kvd_sweep_job() {
 }
 
 kvd_record_job_finished() {
-    local job_id=$1 outcome=$2 state_file="$KVD_STATE_DIR/jobs/$1/state.json" unit exit_status started now duration peak
+    local job_id=$1 outcome=$2 state_file="$KVD_STATE_DIR/jobs/$1/state.json" unit exit_status started now duration peak entry tmp
     unit=$(jq -r '.unit' "$state_file")
     exit_status=$(kvd_unit_exit_status "$unit")
     started=$(jq -r '.started_epoch // .claimed_epoch // 0' "$state_file")
@@ -732,6 +733,27 @@ kvd_record_job_finished() {
     kvd_sample_memory_peak "$job_id" "$unit"
     peak=$(jq -r '.memory_peak_mib // "unknown"' "$state_file")
     kvd_log "job-finished unit=$unit exit=$exit_status duration=${duration}s memory_peak_mib=$peak outcome=$outcome"
+    entry=$(jq -c \
+        --arg outcome "$outcome" \
+        --arg started_at "$(date -u -d "@$started" +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg finished_at "$(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson duration_s "$duration" \
+        --arg exit_status "$exit_status" \
+        '{repo,job_id,unit,outcome:$outcome,started_at:$started_at,finished_at:$finished_at,duration_s:$duration_s,memory_peak_mib:(.memory_peak_mib // null),exit_status:($exit_status | tonumber? // null)}' "$state_file")
+    tmp=$(mktemp "$KVD_STATUS_DIR/.recent.XXXXXX")
+    kvd_recent_jobs | jq -c --argjson entry "$entry" '[$entry] + map(select(.job_id != $entry.job_id or .started_at != $entry.started_at)) | .[:20]' > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$KVD_RECENT_FILE"
+}
+
+# The newest 20 finished jobs, newest first. Kept beside status.json so the history
+# survives dispatcher restarts and host reboots.
+kvd_recent_jobs() {
+    if [[ -r $KVD_RECENT_FILE ]]; then
+        cat -- "$KVD_RECENT_FILE"
+    else
+        printf '[]\n'
+    fi
 }
 
 kvd_handle_inactive_job() {
@@ -1113,7 +1135,7 @@ kvd_write_status() {
         [[ -r $state_file ]] || continue
         unit=$(jq -r '.unit' "$state_file")
         kvd_systemd_active "$unit" || continue
-        item=$(jq -c '{repo,job_id,unit,since}' "$state_file")
+        item=$(jq -c '{repo,job_id,unit,since,memory_peak_mib:(.memory_peak_mib // null)}' "$state_file")
         in_flight=$(jq -c --argjson item "$item" '. + [$item]' <<< "$in_flight")
     done
     for attempt_file in "$KVD_ATTEMPT_DIR"/*.json; do
@@ -1143,7 +1165,8 @@ kvd_write_status() {
         --argjson queued "$queued" \
         --argjson last_poll "$KVD_LAST_POLL_JSON" \
         --argjson blocked "$blocked" \
-        '{updated_at:$updated_at,capacity_mib:$capacity_mib,in_flight:$in_flight,queued:$queued,last_poll:$last_poll,blocked:$blocked}' > "$tmp"
+        --argjson recent "$(kvd_recent_jobs)" \
+        '{updated_at:$updated_at,capacity_mib:$capacity_mib,in_flight:$in_flight,queued:$queued,last_poll:$last_poll,blocked:$blocked,recent:$recent}' > "$tmp"
     chmod 0644 "$tmp"
     mv -f "$tmp" "$KVD_STATUS_FILE"
 }
