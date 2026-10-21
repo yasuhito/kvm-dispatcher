@@ -47,9 +47,7 @@ printf 'Continue? [y/N] ' >/dev/tty
 IFS= read -r answer </dev/tty
 [[ $answer == y || $answer == Y ]] || { printf 'Cancelled.\n' >/dev/tty; exit 1; }
 
-for group in kvm-dispatcher kvm-dispatcher-jobs; do
-    getent group "$group" >/dev/null || { printf 'Install kvm-dispatcher.sysusers.conf before running this wizard.\n' >&2; exit 1; }
-done
+getent group kvm-dispatcher >/dev/null || { printf 'Install kvm-dispatcher.sysusers.conf before running this wizard.\n' >&2; exit 1; }
 install -d -o root -g kvm-dispatcher -m 0750 "$CREDENTIAL_DIR"
 tmp_dir=$(mktemp -d "$CREDENTIAL_DIR/.app-key-wizard.XXXXXX")
 chmod 0700 "$tmp_dir"
@@ -71,8 +69,8 @@ logger --tag kvm-dispatcher-host-wizard "event=app-key-encrypted path=$CREDENTIA
 printf 'Encrypted App key installed. Configure the dispatcher and verify the App permissions before enabling it.\n' >/dev/tty
 printf '%s\n' \
     '' \
-    'Each adapter job user must read its per-job token under /run/kvm-dispatcher/jobs.' \
-    'Add every KVM_DISPATCHER_JOB_USER to kvm-dispatcher-jobs before starting the dispatcher:' \
-    '  usermod -aG kvm-dispatcher-jobs qa2-runner-host' \
-    '  usermod -aG kvm-dispatcher-jobs qoral-runner-host' \
-    'The dispatcher refuses to start while an adapter job user is not a member.' >/dev/tty
+    'Each job token is readable only by its adapter job group (KVM_DISPATCHER_JOB_GROUP).' \
+    'After the QA2 and Qoral job users exist, add the dispatcher to each job group:' \
+    '  usermod -aG qa2-runner-host kvm-dispatcher' \
+    '  usermod -aG qoral-runner-host kvm-dispatcher' \
+    'The dispatcher refuses to start while it is not a member of an adapter job group.' >/dev/tty

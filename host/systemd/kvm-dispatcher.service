@@ -7,8 +7,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=kvm-dispatcher
-Group=kvm-dispatcher-jobs
-SupplementaryGroups=kvm-dispatcher systemd-journal
+Group=kvm-dispatcher
+SupplementaryGroups=systemd-journal
 EnvironmentFile=/etc/kvm-dispatcher/dispatcher.conf
 Environment=KVM_DISPATCHER_CONFIG=/etc/kvm-dispatcher/dispatcher.conf
 ExecStart=/opt/kvm-dispatcher/host/kvm_dispatcher.sh
@@ -16,7 +16,7 @@ Restart=always
 RestartSec=5s
 UMask=0077
 RuntimeDirectory=kvm-dispatcher
-RuntimeDirectoryMode=0710
+RuntimeDirectoryMode=0711
 StateDirectory=kvm-dispatcher
 StateDirectoryMode=0755
 LoadCredentialEncrypted=app-key:/etc/kvm-dispatcher/app-key.cred
