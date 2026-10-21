@@ -14,7 +14,7 @@ The initial Beelink policy is one 12 GiB guest at a time. It records the guest c
 - `host/polkit/50-kvm-dispatcher.rules`: narrow authorization for starting and stopping only supported job templates.
 - `host/repos.d/*.conf.example`: sample adapters. The QA2 and Qoral repositories ship their own adapter config and template service in their respective repositories.
 
-Runtime secrets and job state live under `/run/kvm-dispatcher`. `/run/kvm-dispatcher` and its `jobs` directory are mode 0711, so other users can traverse them but not list job IDs. Each `jobs/<job-id>` directory is 0750 and its `github-token` is 0640, owned `kvm-dispatcher:<adapter job group>` from that adapter's `KVM_DISPATCHER_JOB_GROUP`. A QA2 job user can read QA2 job tokens but not Qoral job tokens, and the reverse. The installation token cache and `state.json` stay private to the dispatcher. Retry and three-strike blocked records live under `/var/lib/kvm-dispatcher/attempts` so a host reboot does not silently unblock a repeatedly failing job. The status document is `/var/lib/kvm-dispatcher/status.json`, written by atomic rename.
+Runtime secrets and job state live under `/run/kvm-dispatcher`. The service sets `RuntimeDirectoryPreserve=yes`, so a dispatcher restart or stop keeps the token paths that running jobs read; the startup sweep reconciles any stale state. `/run/kvm-dispatcher` and its `jobs` directory are mode 0711, so other users can traverse them but not list job IDs. Each `jobs/<job-id>` directory is 0750 and its `github-token` is 0640, owned `kvm-dispatcher:<adapter job group>` from that adapter's `KVM_DISPATCHER_JOB_GROUP`. A QA2 job user can read QA2 job tokens but not Qoral job tokens, and the reverse. The installation token cache and `state.json` stay private to the dispatcher. Retry and three-strike blocked records live under `/var/lib/kvm-dispatcher/attempts` so a host reboot does not silently unblock a repeatedly failing job. The status document is `/var/lib/kvm-dispatcher/status.json`, written by atomic rename.
 
 ## Scheduling and lifecycle
 
@@ -28,8 +28,8 @@ The lifecycle is:
 2. `CLAIMED`: the installation token is copied to `/run/kvm-dispatcher/jobs/<job-id>/github-token` and state is recorded.
 3. `STARTED`, then `RUNNING`: start `<adapter-unit>@<job-id>.service` and monitor it.
 4. `DONE`: the unit exits. Record exit status, duration, and `memory_peak_mib`.
-5. `CANCELLED`: if a job is no longer queued or in progress and its runner registration is not busy, stop its unit.
-6. `STUCK`: stop an active unit after its adapter's `MAX_UNIT_SECONDS` limit.
+5. `CANCELLED`: if a job is no longer queued or in progress and the unit's runner either was never minted or is still registered but idle, stop its unit. A JIT registration disappears once its runner has run a job, so a missing registration means the worker is finishing its own cleanup and is left to exit, with `MAX_UNIT_SECONDS` as the limit.
+6. `STUCK`: stop an active unit after its adapter's `MAX_UNIT_SECONDS` limit. `CANCELLED` and `STUCK` units also record exit status, duration, and `memory_peak_mib` after they stop.
 7. `FAILED`: a failed systemd start is retried after 300 seconds. Three start failures block that job ID until an operator clears its attempt record.
 8. `SWEPT`: if the job script did not delete its own registration, use a newly minted installation token to delete it, then remove that job's runtime state.
 
@@ -101,7 +101,7 @@ Journal events include:
 - `token-refreshed installation=... expires_at=...`
 - `job-discovered repo=... job=... age=...s`
 - `job-started unit=...`
-- `job-finished unit=... exit=... duration=...s memory_peak_mib=...`
+- `job-finished unit=... exit=... duration=...s memory_peak_mib=... outcome=done|cancelled|stuck`
 - `job-cancelled unit=...`
 - `orphan-runner-deleted repo=... runner=...`
 - `orphan-sweep-skipped unit=... reason=...`

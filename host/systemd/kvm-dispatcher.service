@@ -17,6 +17,7 @@ RestartSec=5s
 UMask=0077
 RuntimeDirectory=kvm-dispatcher
 RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
 StateDirectory=kvm-dispatcher
 StateDirectoryMode=0755
 LoadCredentialEncrypted=app-key:/etc/kvm-dispatcher/app-key.cred

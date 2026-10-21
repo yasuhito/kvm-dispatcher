@@ -427,8 +427,9 @@ unset FAKE_HTTP_FAIL_MATCH
 assert_contains "$(<"$FAKE_START_LOG")" 'qa2-runner-job@1014.service'
 assert_contains "$(<"$TMP_DIR/output.log")" 'event=poll-error http=500 repo=qorraq/qoral'
 
-# A vanished, non-busy job stops its unit and deletes the registration named in its journal,
-# because the script did not log its own successful DELETE.
+# A vanished job whose runner is still registered but idle stops its unit, records its
+# outcome, and deletes the registration named in its journal, because the script did not
+# log its own successful DELETE.
 clear_fixtures
 add_job_state qa2 qniapp/qa2 1006 qa2-runner-job@1006.service "$BASE_NOW" 5400
 journal_minted qa2-runner-job@1006.service 77 qa2-kvm-20260101T000001Z-4242
@@ -438,6 +439,16 @@ assert_contains "$(<"$FAKE_STOP_LOG")" 'qa2-runner-job@1006.service'
 assert_contains "$(<"$FAKE_ARGV_LOG")" '--request DELETE'
 assert_contains "$(<"$FAKE_ARGV_LOG")" '/repos/qniapp/qa2/actions/runners/77'
 [[ ! -e $TMP_DIR/state/jobs/1006 ]] || fail 'cancelled job state was not swept'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-finished unit=qa2-runner-job@1006.service exit=0 duration=0s memory_peak_mib=12 outcome=cancelled'
+
+# A job that completed on the unit's own runner leaves no registration behind. The unit is
+# still cleaning up its guest, so it is not stopped as cancelled.
+clear_fixtures
+add_job_state qa2 qniapp/qa2 1019 qa2-runner-job@1019.service "$((BASE_NOW - 600))" 5400
+journal_minted qa2-runner-job@1019.service 82 qa2-kvm-20260101T000004Z-4245
+run_dispatcher
+[[ ! -s $FAKE_STOP_LOG ]] || fail 'a unit cleaning up after its completed job was stopped as cancelled'
+grep -Fxq 'qa2-runner-job@1019.service' "$FAKE_SYSTEMCTL_ACTIVE" || fail 'the finishing unit is no longer active'
 
 # Per-job SWEPT leaves the registration alone when the script logged its own DELETE.
 clear_fixtures
@@ -516,6 +527,7 @@ clear_fixtures
 add_job_state qa2 qniapp/qa2 1007 qa2-runner-job@1007.service "$((BASE_NOW - 5401))" 5400
 run_dispatcher
 assert_contains "$(<"$FAKE_STOP_LOG")" 'qa2-runner-job@1007.service'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-finished unit=qa2-runner-job@1007.service exit=0 duration=5401s memory_peak_mib=12 outcome=stuck'
 
 # Startup resync adopts an active configured unit whose state file was lost.
 clear_fixtures
@@ -602,18 +614,37 @@ if grep -F -e 'PRIVATE_KEY_DO_NOT_LEAK' -e 'ghs_fake_token_secret' "$FAKE_ARGV_L
     fail 'a private key or GitHub token appeared in argv'
 fi
 
-# Verify that the polkit expression allows only the intended template units.
-rule_file="$ROOT_DIR/host/polkit/50-kvm-dispatcher.rules"
-rule_line=$(grep -F 'var allowedUnit =' "$rule_file")
-pattern=${rule_line#*= /}
-pattern=${pattern%;*}
-pattern=${pattern%/}
-for unit in qa2-runner-job@123.service qoral-runner-job@a-1.service; do
-    [[ $unit =~ $pattern ]] || fail "polkit regex rejected $unit"
-done
-for unit in qa2-runner@123.service qoral-runner-job@ABC.service qa2-runner-job@123.service.service qa2-agent-loop-runner-job@0.service; do
-    [[ ! $unit =~ $pattern ]] || fail "polkit regex accepted $unit"
-done
+# Evaluate the polkit rule in a JavaScript engine against a fake polkit object.
+polkit_cases='[
+  ["org.freedesktop.systemd1.manage-units","kvm-dispatcher","start","qa2-runner-job@123.service",true],
+  ["org.freedesktop.systemd1.manage-units","kvm-dispatcher","stop","qoral-runner-job@a-1.service",true],
+  ["org.freedesktop.systemd1.manage-units","kvm-dispatcher","restart","qa2-runner-job@123.service",false],
+  ["org.freedesktop.systemd1.manage-units","kvm-dispatcher","start","qa2-runner@123.service",false],
+  ["org.freedesktop.systemd1.manage-units","kvm-dispatcher","start","qoral-runner-job@ABC.service",false],
+  ["org.freedesktop.systemd1.manage-units","kvm-dispatcher","start","qa2-runner-job@123.service.service",false],
+  ["org.freedesktop.systemd1.manage-units","kvm-dispatcher","start","qa2-agent-loop-runner-job@0.service",false],
+  ["org.freedesktop.systemd1.manage-units","qa2-runner-host","start","qa2-runner-job@123.service",false],
+  ["org.freedesktop.systemd1.manage-unit-files","kvm-dispatcher","start","qa2-runner-job@123.service",false]
+]'
+# shellcheck disable=SC2016
+node -e '
+const fs = require("fs");
+const [file, cases] = process.argv.slice(1);
+const rules = [];
+const polkit = { Result: { YES: "yes" }, addRule: (rule) => rules.push(rule) };
+new Function("polkit", fs.readFileSync(file, "utf8"))(polkit);
+let failed = false;
+for (const [id, user, verb, unit, expected] of JSON.parse(cases)) {
+  const values = { unit, verb };
+  const action = { id, lookup: (key) => values[key] };
+  const allowed = rules.some((rule) => rule(action, { user }) === polkit.Result.YES);
+  if (allowed !== expected) {
+    console.error(`polkit ${allowed ? "allowed" : "denied"} ${user} ${verb} ${unit} (${id})`);
+    failed = true;
+  }
+}
+process.exit(failed ? 1 : 0);
+' "$ROOT_DIR/host/polkit/50-kvm-dispatcher.rules" "$polkit_cases" || fail 'polkit rule authorized the wrong units'
 
 # Verify the unit together with its isolation drop-in in a disposable systemd root.
 VERIFY_ROOT="$TMP_DIR/systemd-root"

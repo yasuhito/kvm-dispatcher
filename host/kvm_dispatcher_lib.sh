@@ -467,10 +467,7 @@ kvd_prepare_discovered_job() {
     created_at=$(jq -r '.created_at' <<< "$item")
     state_dir="$KVD_STATE_DIR/jobs/$id"
     state_file="$state_dir/state.json"
-    if [[ -r $state_file ]]; then
-        [[ $(jq -r '.phase' "$state_file") == DISCOVERED ]] && return 0
-        return 0
-    fi
+    [[ -r $state_file ]] && return 0
 
     attempt_file="$KVD_ATTEMPT_DIR/$id.json"
     now=$(kvd_now)
@@ -660,21 +657,18 @@ kvd_job_runner_identity() {
     KVD_RUNNER_DELETED=$KVD_JOURNAL_RUNNER_DELETED
 }
 
-kvd_runner_busy() {
+# KVD_RUNNER_STATE is unidentified (no runner minted yet), busy, idle (registered and
+# waiting), or absent. A JIT registration exists from minting until its one job ends,
+# so an absent registration means the runner already ran a job and the unit is cleaning up.
+kvd_runner_state() {
     local adapter=$1 job_id=$2 unit=$3 installation=${KVD_A_INSTALLATION[$1]} repo=${KVD_A_REPO[$1]}
-    KVD_RUNNER_BUSY=false
-    if ! kvd_job_runner_identity "$adapter" "$job_id" "$unit"; then
-        KVD_RUNNER_BUSY=unknown
-        return 1
-    fi
+    kvd_job_runner_identity "$adapter" "$job_id" "$unit" || return 1
+    KVD_RUNNER_STATE=unidentified
     [[ -n $KVD_RUNNER_NAME ]] || return 0
-    if ! kvd_list_runners "$installation" "$repo"; then
-        KVD_RUNNER_BUSY=unknown
-        return 1
-    fi
-    if jq -e --arg name "$KVD_RUNNER_NAME" '.runners[]? | select(.name == $name and .busy == true)' <<< "$KVD_RUNNERS" >/dev/null; then
-        KVD_RUNNER_BUSY=true
-    fi
+    kvd_list_runners "$installation" "$repo" || return 1
+    KVD_RUNNER_STATE=$(jq -r --arg name "$KVD_RUNNER_NAME" '
+      [.runners[]? | select(.name == $name)]
+      | if length == 0 then "absent" elif any(.[]; .busy == true) then "busy" else "idle" end' <<< "$KVD_RUNNERS")
 }
 
 kvd_sweep_job() {
@@ -711,8 +705,20 @@ kvd_sweep_job() {
     kvd_log "job-swept repo=$repo job=$job_id"
 }
 
+kvd_record_job_finished() {
+    local job_id=$1 outcome=$2 state_file="$KVD_STATE_DIR/jobs/$1/state.json" unit exit_status started now duration peak
+    unit=$(jq -r '.unit' "$state_file")
+    exit_status=$(kvd_unit_exit_status "$unit")
+    started=$(jq -r '.started_epoch // .claimed_epoch // 0' "$state_file")
+    now=$(kvd_now)
+    duration=$((now - started))
+    (( duration < 0 )) && duration=0
+    peak=$(kvd_unit_memory_peak_mib "$unit")
+    kvd_log "job-finished unit=$unit exit=$exit_status duration=${duration}s memory_peak_mib=$peak outcome=$outcome"
+}
+
 kvd_handle_inactive_job() {
-    local job_id=$1 state_file state_dir adapter unit phase exit_status started now duration peak repo
+    local job_id=$1 state_file state_dir adapter unit phase repo
     state_file="$KVD_STATE_DIR/jobs/$job_id/state.json"
     [[ -r $state_file ]] || return 0
     adapter=$(jq -r '.adapter' "$state_file")
@@ -734,13 +740,7 @@ kvd_handle_inactive_job() {
             return 0
             ;;
     esac
-    exit_status=$(kvd_unit_exit_status "$unit")
-    started=$(jq -r '.started_epoch // .claimed_epoch // 0' "$state_file")
-    now=$(kvd_now)
-    duration=$((now - started))
-    (( duration < 0 )) && duration=0
-    peak=$(kvd_unit_memory_peak_mib "$unit")
-    kvd_log "job-finished unit=$unit exit=$exit_status duration=${duration}s memory_peak_mib=$peak"
+    kvd_record_job_finished "$job_id" "done"
     kvd_mark_job_consumed "$job_id"
     kvd_set_job_phase "$job_id" DONE
     kvd_sweep_job "$job_id" || true
@@ -902,7 +902,7 @@ kvd_schedule_queued() {
 }
 
 kvd_monitor_inflight() {
-    local state_file job_id adapter unit phase started max_seconds now elapsed status busy
+    local state_file job_id adapter unit phase started max_seconds now elapsed status
     now=$(kvd_now)
     for state_file in "$KVD_STATE_DIR"/jobs/*/state.json; do
         [[ -r $state_file ]] || continue
@@ -939,6 +939,7 @@ kvd_monitor_inflight() {
         elapsed=$((now - started))
         if (( elapsed > max_seconds )); then
             if systemctl stop "$unit"; then
+                kvd_record_job_finished "$job_id" stuck
                 kvd_mark_job_consumed "$job_id"
                 kvd_set_job_phase "$job_id" STUCK
                 kvd_log "job-stuck unit=$unit duration=${elapsed}s"
@@ -950,9 +951,10 @@ kvd_monitor_inflight() {
         [[ ${KVD_REPO_OK[$adapter]:-0} == 1 ]] || continue
         status=$(jq -r --arg id "$job_id" '.[$id].status // "gone"' <<< "$KVD_JOB_MAP")
         if [[ $status != queued && $status != in_progress ]]; then
-            if kvd_runner_busy "$adapter" "$job_id" "$unit"; then
-                busy=$KVD_RUNNER_BUSY
-                if [[ $busy == false ]] && systemctl stop "$unit"; then
+            if kvd_runner_state "$adapter" "$job_id" "$unit" &&
+                [[ $KVD_RUNNER_STATE == unidentified || $KVD_RUNNER_STATE == idle ]]; then
+                if systemctl stop "$unit"; then
+                    kvd_record_job_finished "$job_id" cancelled
                     kvd_mark_job_consumed "$job_id"
                     kvd_set_job_phase "$job_id" CANCELLED
                     kvd_log "job-cancelled unit=$unit"
