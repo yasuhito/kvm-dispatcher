@@ -172,8 +172,13 @@ case $command in
         done
         case $property in
             ExecMainStatus) printf '%s\n' "${FAKE_EXEC_MAIN_STATUS:-0}" ;;
-            ControlGroup) printf '/system.slice/%s\n' "$unit" ;;
-            MemoryPeak) printf '%s\n' "${FAKE_MEMORY_PEAK:-12582912}" ;;
+            # Like systemd, a unit that has exited has no cgroup and no MemoryPeak.
+            ControlGroup)
+                if grep -Fxq -- "$unit" "$FAKE_SYSTEMCTL_ACTIVE"; then printf '/system.slice/%s\n' "$unit"; else printf '\n'; fi
+                ;;
+            MemoryPeak)
+                if grep -Fxq -- "$unit" "$FAKE_SYSTEMCTL_ACTIVE"; then printf '%s\n' "${FAKE_MEMORY_PEAK:-12582912}"; else printf '[not set]\n'; fi
+                ;;
             ActiveEnterTimestamp) printf '%s\n' '2026-01-01 00:00:00 UTC' ;;
             *) printf '\n' ;;
         esac
@@ -522,12 +527,16 @@ kvd_handle_inactive_job 1015 > "$TMP_DIR/output.log"
 ! grep -Fq -- '--request DELETE' "$FAKE_ARGV_LOG" || fail 'SWEPT deleted a registration the job script had already deleted'
 assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-swept repo=qniapp/qa2 job=1015'
 
-# Finished units report cgroup memory peaks and are not relaunched for a still-queued job ID.
+# Finished units report the memory peak sampled while active (systemd forgets it once the
+# unit exits) and are not relaunched for a still-queued job ID.
 clear_fixtures
 add_job_state qa2 qniapp/qa2 1010 qa2-runner-job@1010.service "$((BASE_NOW - 90))" 5400
-: > "$FAKE_SYSTEMCTL_ACTIVE"
+printf '%s\n' 'qa2-runner-job@1010.service' > "$FAKE_SYSTEMCTL_ACTIVE"
 set_runs qniapp_qa2 queued '[{"id":105}]'
 set_jobs qniapp_qa2 105 '[{"id":1010,"status":"queued","created_at":"2026-01-01T00:00:01Z","labels":["qa2-kvm"]}]'
+run_dispatcher
+FAKE_MEMORY_PEAK=1048576 run_dispatcher
+: > "$FAKE_SYSTEMCTL_ACTIVE"
 run_dispatcher
 assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-finished unit=qa2-runner-job@1010.service exit=0 duration=90s memory_peak_mib=12'
 [[ ! -s $FAKE_START_LOG ]] || fail 'dispatcher relaunched a job ID after its runner unit had already run'

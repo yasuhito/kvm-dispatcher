@@ -591,6 +591,16 @@ kvd_unit_memory_peak_mib() {
     fi
 }
 
+# systemd drops a unit's cgroup and MemoryPeak once it exits, so the peak is sampled
+# while the unit is active and the maximum is kept in state.json.
+kvd_sample_memory_peak() {
+    local job_id=$1 unit=$2 peak
+    peak=$(kvd_unit_memory_peak_mib "$unit")
+    [[ $peak =~ ^[0-9]+$ ]] || return 0
+    # shellcheck disable=SC2016
+    kvd_update_job_state "$job_id" '.memory_peak_mib = ([.memory_peak_mib // 0, $peak] | max)' --argjson peak "$peak"
+}
+
 kvd_update_job_state() {
     local job_id=$1 filter=$2 state_file tmp
     shift 2
@@ -719,7 +729,8 @@ kvd_record_job_finished() {
     now=$(kvd_now)
     duration=$((now - started))
     (( duration < 0 )) && duration=0
-    peak=$(kvd_unit_memory_peak_mib "$unit")
+    kvd_sample_memory_peak "$job_id" "$unit"
+    peak=$(jq -r '.memory_peak_mib // "unknown"' "$state_file")
     kvd_log "job-finished unit=$unit exit=$exit_status duration=${duration}s memory_peak_mib=$peak outcome=$outcome"
 }
 
@@ -929,6 +940,7 @@ kvd_monitor_inflight() {
             kvd_handle_inactive_job "$job_id"
             continue
         fi
+        kvd_sample_memory_peak "$job_id" "$unit"
         case $phase in
             DONE|CANCELLED|STUCK|FAILED)
                 if systemctl stop "$unit"; then
