@@ -14,7 +14,7 @@ The initial Beelink policy is one 12 GiB guest at a time. It records the guest c
 - `host/polkit/50-kvm-dispatcher.rules`: narrow authorization for starting and stopping only supported job templates.
 - `host/repos.d/*.conf.example`: sample adapters. The QA2 and Qoral repositories ship their own adapter config and template service in their respective repositories.
 
-Runtime secrets and job state live under `/run/kvm-dispatcher` (mode 0700). Retry and three-strike blocked records live under `/var/lib/kvm-dispatcher/attempts` so a host reboot does not silently unblock a repeatedly failing job. The status document is `/var/lib/kvm-dispatcher/status.json`, written by atomic rename.
+Runtime secrets and job state live under `/run/kvm-dispatcher`. The dispatcher's primary group is `kvm-dispatcher-jobs`; `/run/kvm-dispatcher` and its `jobs` directory are mode 0710 with that group, each `jobs/<job-id>` directory is 0750, and its `github-token` is 0640, all owned `kvm-dispatcher:kvm-dispatcher-jobs`. Adapter job users in that group can therefore read only the token path they are given. The installation token cache and `state.json` stay private to the dispatcher. Retry and three-strike blocked records live under `/var/lib/kvm-dispatcher/attempts` so a host reboot does not silently unblock a repeatedly failing job. The status document is `/var/lib/kvm-dispatcher/status.json`, written by atomic rename.
 
 ## Scheduling and lifecycle
 
@@ -33,13 +33,13 @@ The lifecycle is:
 7. `FAILED`: a failed systemd start is retried after 300 seconds. Three start failures block that job ID until an operator clears its attempt record.
 8. `SWEPT`: if the job script did not delete its own registration, use a newly minted installation token to delete it, then remove that job's runtime state.
 
-A successfully started job ID is not launched a second time if GitHub still reports it queued after its unit exits. That condition is shown in `blocked` as `unit-already-ran`; rerun the workflow to get a new job ID. A systemd start failure is different because no worker unit was started, so it follows the 300-second retry and three-strike policy.
+A JIT runner can take any queued job with matching labels, not necessarily the one that triggered its unit. When a unit exits, the dispatcher reads the runner name from that invocation's journal and asks GitHub which runner ran the triggering job. Only a job that this runner actually ran is consumed, shown in `blocked` as `unit-already-ran`; a triggering job that the runner did not run (`job-not-run`) returns to the candidates. When the runner or the job's `runner_name` cannot be determined, the dispatcher logs `job-attribution-unknown` and keeps the job consumed; rerun the workflow to get a new job ID. A systemd start failure is different because no worker unit was started, so it follows the 300-second retry and three-strike policy.
 
 The job scripts keep their own runner names, such as `qa2-kvm-<UTC time>-<pid>`. The dispatcher identifies a job's registration from its unit instance journal, where the script logs `event=jitconfig-minted runner_id=<id> runner_name=<name>` and, after its own cleanup, `event=runner-deleted runner_id=<id>`. A script may instead write the exact name to `/run/kvm-dispatcher/jobs/<job-id>/runner-name`; that file is optional and takes precedence over the journal name. Only names under the adapter's `KVM_DISPATCHER_RUNNER_NAME_PREFIX` are ever deleted. The service runs with `SupplementaryGroups=systemd-journal` to read these journals.
 
 The startup sweep adopts active configured `*-runner-job@*` units and sweeps stale state without an active unit. It then deletes registrations under an adapter's runner-name prefix that are offline, not busy, and not referenced by the journal or `runner-name` file of any active `*-runner-job@*` unit. If an active unit has no identifiable registration yet, the orphan sweep is skipped rather than risking a live runner. It does not delete registrations belonging to other prefixes.
 
-GitHub API failures use per-adapter retry intervals of 20, 60, then 300 seconds. While one adapter is failing or backing off, the others keep scheduling in FIFO order among themselves, so one installation's outage does not stop another repository's CI. In-flight unit, timeout, and memory monitoring continues on every loop during those intervals.
+GitHub API failures use per-adapter retry intervals of 20, 60, then 300 seconds. While one adapter is failing or backing off, the others keep scheduling in FIFO order among themselves, so one installation's outage does not stop another repository's CI. A skipped adapter's queued jobs re-enter the FIFO after its next successful poll. In-flight unit, timeout, and memory monitoring continues on every loop during those intervals.
 
 ## GitHub App and secrets
 
@@ -51,26 +51,26 @@ The GitHub App needs repository permissions:
 
 Restrict each installation to only the repository it serves. The example IDs in `host/dispatcher.conf.example` are the existing App (`5405924`) and its QA2 and Qoral installations; replace them if using another App. `KVM_DISPATCHER_INSTALLATIONS` and the corresponding `KVM_DISPATCHER_REPOSITORY_<ALIAS>` mappings let an empty `repos.d` verify token access and runner-list permissions for both installations before any adapter is enabled. Do not commit a PEM, installation token, or generated credential.
 
-The service receives the PEM only as `LoadCredentialEncrypted=app-key:...`. It signs short-lived RS256 JWTs with `openssl dgst -sha256 -sign` and exchanges them for installation tokens. Tokens are cached per installation and refreshed with less than ten minutes remaining. GitHub requests put authentication in curl's config stream on stdin, not in curl arguments. Job token copies are atomically refreshed while their units remain active, which lets a Qoral adapter that uses an indirect host token path keep cleanup working after a long job. The token is not copied into the guest.
+The service receives the PEM only as `LoadCredentialEncrypted=app-key:...`. It signs short-lived RS256 JWTs with `openssl dgst -sha256 -sign` and exchanges them for installation tokens. Tokens are cached per installation and refreshed with less than ten minutes remaining. GitHub requests put authentication in curl's config stream on stdin, not in curl arguments. Job token copies are refreshed while their units remain active by writing a temporary file with the same group and 0640 mode and renaming it into place, which lets a Qoral adapter that uses an indirect host token path keep cleanup working after a long job. The token is not copied into the guest.
 
 Run the host wizard from a root-controlled terminal. Confirm the displayed action, paste the PEM with terminal echo disabled, and press Ctrl-D. `systemd-creds encrypt` consumes it on stdin; the wizard installs only the encrypted credential, writes an audit event to the journal, and leaves service activation to the operator.
 
 ## Configuration and adding a repository
 
 1. Install the host scripts under `/opt/kvm-dispatcher/host/`, the service and drop-in under `/etc/systemd/system/`, and the polkit rule under `/etc/polkit-1/rules.d/`.
-2. Install `kvm-dispatcher.sysusers.conf` and `kvm-dispatcher.tmpfiles.conf` into the systemd sysusers and tmpfiles configuration directories. Run `systemd-sysusers` and `systemd-tmpfiles --create`.
+2. Install `kvm-dispatcher.sysusers.conf` and `kvm-dispatcher.tmpfiles.conf` into the systemd sysusers and tmpfiles configuration directories. Run `systemd-sysusers` and `systemd-tmpfiles --create`. Add each adapter's job user to the job group, for example `usermod -aG kvm-dispatcher-jobs qa2-runner-host` and `usermod -aG kvm-dispatcher-jobs qoral-runner-host`. The dispatcher checks this membership at startup and refuses to start without it.
 3. Copy `host/dispatcher.conf.example` to `/etc/kvm-dispatcher/dispatcher.conf`, set the App and installation IDs, and keep the file root-owned and readable by the `kvm-dispatcher` group. Use the wizard to install `app-key.cred`.
 4. For every repository, install its adapter file in `/etc/kvm-dispatcher/repos.d/<name>.conf` and its own template unit `<adapter-unit>@.service`. The dispatcher reads adapter files at startup, so restart it after adding or changing adapters. Startup resync adopts running job units. Verify the installation before enabling the dispatcher.
 
 A repository joins by shipping those two files:
 
-- Its adapter config sets `KVM_DISPATCHER_REPO`, `KVM_DISPATCHER_INSTALLATION`, `KVM_DISPATCHER_LABELS`, `KVM_DISPATCHER_UNIT`, `KVM_DISPATCHER_RUNNER_NAME_PREFIX`, `KVM_DISPATCHER_MAX_UNIT_SECONDS`, `KVM_DISPATCHER_MEMORY_MIB`, and `KVM_DISPATCHER_CONCURRENCY`. See the QA2 and Qoral examples in `host/repos.d/`.
+- Its adapter config sets `KVM_DISPATCHER_REPO`, `KVM_DISPATCHER_INSTALLATION`, `KVM_DISPATCHER_LABELS`, `KVM_DISPATCHER_UNIT`, `KVM_DISPATCHER_RUNNER_NAME_PREFIX`, `KVM_DISPATCHER_MAX_UNIT_SECONDS`, `KVM_DISPATCHER_MEMORY_MIB`, `KVM_DISPATCHER_CONCURRENCY`, and `KVM_DISPATCHER_JOB_USER` (the `User=` of its job template). See the QA2 and Qoral examples in `host/repos.d/`.
 - Its `Restart=no` template unit runs the existing one-job script, loads the token with `LoadCredential=github-token:/run/kvm-dispatcher/jobs/%i/github-token`, and sets `MemoryAccounting=yes` so per-job peak usage is available. Do not add an idle restart loop. The unit must not require `github-token.cred`, since the dispatcher supplies the credential per job.
 - Keep both drop-ins under `<adapter-unit>@.service.d/`: the repository's own `10-isolation.conf` for its isolation policy, and `20-job-runtime.conf` from `host/systemd/examples/`. `RuntimeDirectory=` is list-valued and re-specifying it appends, so `20-job-runtime.conf` first clears the shared directory set by `10-isolation.conf` and then sets a per-job `RuntimeDirectory` with `RuntimeDirectoryMode=0700`. Without it, `RUNTIME_DIRECTORY` would name two directories and concurrent instances would share one.
 - `KVM_DISPATCHER_RUNNER_NAME_PREFIX` must be the common prefix of the runner names the existing job script generates, for example `qa2-kvm-`. The allowed unit prefix and runner name are validated to avoid arbitrary systemd unit starts.
 - For Qoral, set `QORAL_RUNNER_GITHUB_TOKEN_FILE=/run/kvm-dispatcher/jobs/%i/github-token` in the template and make its token-file helper honor that override. `LoadCredential` is a snapshot at unit start; the indirect host path is what lets the long-running script read a refreshed token for final runner deletion. QA2 can continue reading the systemd credential directory because its job duration is below one hour.
 
-The polkit rule allows `kvm-dispatcher` to start or stop only the `qa2` and `qoral` runner-job templates with lowercase alphanumeric or hyphen instance names. It does not grant permission to manage legacy services or other systemd units.
+The polkit rule allows `kvm-dispatcher` to start or stop only the `qa2` and `qoral` runner-job templates with lowercase alphanumeric or hyphen instance names. It does not grant permission to manage legacy services or other systemd units. When a third adapter is actually shipped, add its template name to both the `allowedUnit` expression in `host/polkit/50-kvm-dispatcher.rules` and the `KVM_DISPATCHER_UNIT` check in `kvd_load_config`, then extend the polkit cases in `host/kvm_dispatcher_host_test.sh`.
 
 ## Operations
 
@@ -94,7 +94,7 @@ jq . /var/lib/kvm-dispatcher/status.json
 }
 ```
 
-The `queued` list omits jobs already claimed by a unit. `in_flight` includes only active units. A three-strike start failure can be retried by removing its JSON record from `/var/lib/kvm-dispatcher/attempts/` after investigating the failure. A `unit-already-ran` record means the worker unit exited while GitHub still reports that job queued; the dispatcher will not start the same job ID again, so rerun the workflow or remove that record only after investigating.
+The `queued` list omits jobs already claimed by a unit. `in_flight` includes only active units. A three-strike start failure can be retried by removing its JSON record from `/var/lib/kvm-dispatcher/attempts/` after investigating the failure. A `unit-already-ran` record means a worker unit ran that job, or its runner could not be attributed, while GitHub still reports the job queued; the dispatcher will not start the same job ID again, so rerun the workflow or remove that record only after investigating.
 
 Journal events include:
 
@@ -105,7 +105,8 @@ Journal events include:
 - `job-cancelled unit=...`
 - `orphan-runner-deleted repo=... runner=...`
 - `orphan-sweep-skipped unit=... reason=...`
-- `poll-error http=... repo=... retry_in=...s`
+- `poll-error http=... repo=... retry_in=...s`, and `poll-error repo=... skipped=true retry_in=...s` for each loop an adapter spends in backoff
+- `job-not-run repo=... job=... runner=...` and `job-attribution-unknown repo=... job=...`
 - `job-start-failed`, `job-blocked`, `job-stuck`, and `job-swept` for state transitions and cleanup.
 
 ## Migration and rollback

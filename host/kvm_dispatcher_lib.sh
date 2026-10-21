@@ -5,6 +5,7 @@ set -o errexit -o nounset -o pipefail
 
 KVD_API_URL=${KVD_API_URL:-https://api.github.com}
 KVD_API_VERSION=2022-11-28
+KVD_JOB_GROUP=kvm-dispatcher-jobs
 KVD_HTTP=000
 KVD_BODY=
 KVD_TOKEN=
@@ -94,7 +95,9 @@ kvd_load_config() {
     done
 
     mkdir -p "$KVD_STATE_DIR/jobs" "$KVD_STATE_DIR/tokens" "$KVD_ATTEMPT_DIR"
-    chmod 0700 "$KVD_STATE_DIR" "$KVD_STATE_DIR/jobs" "$KVD_STATE_DIR/tokens" "$KVD_ATTEMPT_DIR"
+    chgrp "$KVD_JOB_GROUP" "$KVD_STATE_DIR" "$KVD_STATE_DIR/jobs"
+    chmod 0710 "$KVD_STATE_DIR" "$KVD_STATE_DIR/jobs"
+    chmod 0700 "$KVD_STATE_DIR/tokens" "$KVD_ATTEMPT_DIR"
     chmod 0755 "$KVD_STATUS_DIR"
 
     KVD_ADAPTER_NAMES=()
@@ -117,6 +120,7 @@ kvd_load_config() {
         local KVM_DISPATCHER_REPO='' KVM_DISPATCHER_INSTALLATION='' KVM_DISPATCHER_LABELS=''
         local KVM_DISPATCHER_UNIT='' KVM_DISPATCHER_RUNNER_NAME_PREFIX=''
         local KVM_DISPATCHER_MAX_UNIT_SECONDS='' KVM_DISPATCHER_MEMORY_MIB='' KVM_DISPATCHER_CONCURRENCY=''
+        local KVM_DISPATCHER_JOB_USER=''
         # shellcheck source=/dev/null
         source "$conf"
 
@@ -128,6 +132,9 @@ kvd_load_config() {
         kvd_positive_integer "$KVM_DISPATCHER_MAX_UNIT_SECONDS" || kvd_die "invalid max unit time in $conf"
         kvd_positive_integer "$KVM_DISPATCHER_MEMORY_MIB" || kvd_die "invalid memory in $conf"
         kvd_positive_integer "$KVM_DISPATCHER_CONCURRENCY" || kvd_die "invalid concurrency in $conf"
+        [[ $KVM_DISPATCHER_JOB_USER =~ ^[a-z_][a-z0-9_-]*$ ]] || kvd_die "invalid job user in $conf"
+        [[ " $(id -nG "$KVM_DISPATCHER_JOB_USER" 2>/dev/null) " == *" $KVD_JOB_GROUP "* ]] ||
+            kvd_die "job user $KVM_DISPATCHER_JOB_USER is not a member of $KVD_JOB_GROUP (usermod -aG $KVD_JOB_GROUP $KVM_DISPATCHER_JOB_USER)"
         [[ -z ${KVD_A_REPO[$name]+present} ]] || kvd_die "duplicate adapter name: $name"
 
         KVD_ADAPTER_NAMES+=("$name")
@@ -211,8 +218,28 @@ kvd_curl_call() {
     (( 10#$KVD_HTTP >= 200 && 10#$KVD_HTTP < 300 ))
 }
 
+# Job directories and token copies are group-readable by kvm-dispatcher-jobs, whose
+# members are the adapters' job users, so a long job can read a refreshed token.
+kvd_make_job_dir() {
+    local dir="$KVD_STATE_DIR/jobs/$1"
+    mkdir -p "$dir" || return 1
+    chgrp "$KVD_JOB_GROUP" "$dir" || return 1
+    chmod 0750 "$dir"
+}
+
+kvd_write_job_token() {
+    local job_id=$1 token=$2 dir tmp
+    dir="$KVD_STATE_DIR/jobs/$job_id"
+    tmp=$(mktemp "$dir/.github-token.XXXXXX") || return 1
+    printf '%s' "$token" > "$tmp"
+    if ! { chgrp "$KVD_JOB_GROUP" "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" "$dir/github-token"; }; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
 kvd_refresh_job_token_copies() {
-    local installation=$1 token=$2 state_file job_id adapter unit token_file tmp current
+    local installation=$1 token=$2 state_file job_id adapter unit token_file current
     for state_file in "$KVD_STATE_DIR"/jobs/*/state.json; do
         [[ -r $state_file ]] || continue
         adapter=$(jq -r '.adapter' "$state_file")
@@ -225,10 +252,7 @@ kvd_refresh_job_token_copies() {
         current=''
         [[ -r $token_file ]] && current=$(<"$token_file")
         [[ $current == "$token" ]] && continue
-        tmp="$KVD_STATE_DIR/jobs/$job_id/.github-token.$$.tmp"
-        printf '%s' "$token" > "$tmp"
-        chmod 0600 "$tmp"
-        mv -f "$tmp" "$token_file"
+        kvd_write_job_token "$job_id" "$token" || true
     done
 }
 
@@ -340,6 +364,8 @@ kvd_poll_adapter() {
     now=$(kvd_now)
     if (( now < ${KVD_NEXT_POLL[$adapter]:-0} )); then
         KVD_REPO_OK[$adapter]=0
+        (( ${KVD_POLL_FAILURES[$adapter]:-0} > 0 )) &&
+            kvd_log "poll-error repo=$repo skipped=true retry_in=$(( KVD_NEXT_POLL[$adapter] - now ))s"
         return 0
     fi
 
@@ -456,8 +482,7 @@ kvd_prepare_discovered_job() {
     fi
 
     unit="${KVD_A_UNIT[$adapter]}$id.service"
-    mkdir -p "$state_dir"
-    chmod 0700 "$state_dir"
+    kvd_make_job_dir "$id" || return 0
     now_iso=$(kvd_iso_now)
     jq -cn \
         --arg adapter "$adapter" --arg repo "$repo" --arg job_id "$id" \
@@ -596,11 +621,13 @@ kvd_mark_job_running() {
 
 # Job scripts name their own runners and log `event=jitconfig-minted runner_id=N
 # runner_name=NAME` and, after their own cleanup, `event=runner-deleted runner_id=N`.
+# Only entries since the unit's start are read, so a relaunched job ID ignores the
+# previous invocation's runner.
 kvd_unit_journal_runner() {
-    local unit=$1 journal line minted_id='' deleted_id=''
+    local unit=$1 since=${2:-0} journal line minted_id='' deleted_id=''
     KVD_JOURNAL_RUNNER_NAME=''
     KVD_JOURNAL_RUNNER_DELETED=false
-    journal=$(journalctl --unit="$unit" --output=cat --no-pager --quiet 2>/dev/null) || return 1
+    journal=$(journalctl --unit="$unit" --since="@$since" --output=cat --no-pager --quiet 2>/dev/null) || return 1
     while IFS= read -r line; do
         if [[ $line =~ (^|[[:space:]])event=jitconfig-minted[[:space:]]+runner_id=([0-9]+)[[:space:]]+runner_name=([A-Za-z0-9_.-]+)([[:space:]]|$) ]]; then
             minted_id=${BASH_REMATCH[2]}
@@ -614,13 +641,19 @@ kvd_unit_journal_runner() {
     return 0
 }
 
+kvd_job_started_epoch() {
+    local state_file="$KVD_STATE_DIR/jobs/$1/state.json"
+    [[ -r $state_file ]] || { printf '0'; return 0; }
+    jq -r '.started_epoch // .claimed_epoch // 0' "$state_file"
+}
+
 # Resolve a job's registration from the optional runner-name file, else the unit journal.
 # KVD_RUNNER_NAME stays empty when no registration under the adapter prefix is known.
 kvd_job_runner_identity() {
     local adapter=$1 job_id=$2 unit=$3 prefix=${KVD_A_PREFIX[$1]} name name_file
     KVD_RUNNER_NAME=''
     KVD_RUNNER_DELETED=false
-    kvd_unit_journal_runner "$unit" || return 1
+    kvd_unit_journal_runner "$unit" "$(kvd_job_started_epoch "$job_id")" || return 1
     name=$KVD_JOURNAL_RUNNER_NAME
     name_file="$KVD_STATE_DIR/jobs/$job_id/runner-name"
     [[ -r $name_file ]] && name=$(<"$name_file")
@@ -742,11 +775,25 @@ kvd_mark_start_failure() {
     fi
 }
 
+# A JIT runner may take any matching queued job, so the dispatching job ID is consumed
+# only when GitHub reports that this unit's runner ran it. A job that was not run
+# returns to the candidates. Unknown attribution keeps the job consumed.
 kvd_mark_job_consumed() {
-    local job_id=$1 state_file="$KVD_STATE_DIR/jobs/$1/state.json" attempt_file adapter repo tmp
+    local job_id=$1 state_file="$KVD_STATE_DIR/jobs/$1/state.json" attempt_file adapter repo unit tmp ran_by
     [[ -r $state_file ]] || return 0
     adapter=$(jq -r '.adapter' "$state_file")
     repo=$(jq -r '.repo' "$state_file")
+    unit=$(jq -r '.unit' "$state_file")
+    if kvd_job_runner_identity "$adapter" "$job_id" "$unit" && [[ -n $KVD_RUNNER_NAME ]] &&
+        kvd_github_request "${KVD_A_INSTALLATION[$adapter]}" GET "/repos/$repo/actions/jobs/$job_id" &&
+        ran_by=$(jq -er '.runner_name // ""' <<< "$KVD_BODY"); then
+        if [[ $ran_by != "$KVD_RUNNER_NAME" ]]; then
+            kvd_log "job-not-run repo=$repo job=$job_id runner=$KVD_RUNNER_NAME"
+            return 0
+        fi
+    else
+        kvd_log "job-attribution-unknown repo=$repo job=$job_id"
+    fi
     attempt_file="$KVD_ATTEMPT_DIR/$job_id.json"
     tmp=$(mktemp "$KVD_ATTEMPT_DIR/.${job_id}.XXXXXX")
     jq -cn --arg adapter "$adapter" --arg repo "$repo" --arg job_id "$job_id" \
@@ -817,10 +864,8 @@ kvd_start_candidate() {
         return 1
     fi
     state_dir="$KVD_STATE_DIR/jobs/$id"
-    mkdir -p "$state_dir" || return 1
-    chmod 0700 "$state_dir"
-    printf '%s' "$KVD_TOKEN" > "$state_dir/github-token"
-    chmod 0600 "$state_dir/github-token"
+    kvd_make_job_dir "$id" || return 1
+    kvd_write_job_token "$id" "$KVD_TOKEN" || return 1
     now=$(kvd_now)
     now_iso=$(kvd_iso_now)
     state_file="$state_dir/state.json"
@@ -942,8 +987,7 @@ kvd_adopt_active_units() {
             [[ $job_id =~ ^[0-9a-z-]+$ ]] || continue
             state_dir="$KVD_STATE_DIR/jobs/$job_id"
             state_file="$state_dir/state.json"
-            mkdir -p "$state_dir"
-            chmod 0700 "$state_dir"
+            kvd_make_job_dir "$job_id"
             if [[ -r $state_file ]]; then
                 phase=$(jq -r '.phase' "$state_file")
                 if [[ $phase == DISCOVERED ]]; then
@@ -987,16 +1031,17 @@ kvd_sweep_orphan_runners() {
     done
     while IFS= read -r unit; do
         [[ -n $unit ]] || continue
-        if ! kvd_unit_journal_runner "$unit"; then
+        job_id=${unit#*-runner-job@}
+        job_id=${job_id%.service}
+        [[ $job_id =~ ^[0-9a-z-]+$ ]] || job_id=''
+        if ! kvd_unit_journal_runner "$unit" "$(kvd_job_started_epoch "$job_id")"; then
             kvd_log "orphan-sweep-skipped unit=$unit reason=journal-unavailable"
             return 0
         fi
-        job_id=${unit#*-runner-job@}
-        job_id=${job_id%.service}
         name_file="$KVD_STATE_DIR/jobs/$job_id/runner-name"
         names=()
         [[ -n $KVD_JOURNAL_RUNNER_NAME ]] && names+=("$KVD_JOURNAL_RUNNER_NAME")
-        [[ $job_id =~ ^[0-9a-z-]+$ && -r $name_file ]] && names+=("$(<"$name_file")")
+        [[ -n $job_id && -r $name_file ]] && names+=("$(<"$name_file")")
         if (( ${#names[@]} == 0 )); then
             kvd_log "orphan-sweep-skipped unit=$unit reason=runner-unidentified"
             return 0

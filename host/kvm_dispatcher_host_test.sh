@@ -29,6 +29,8 @@ export FAKE_START_FAILURES="$TMP_DIR/start-failures"
 export FAKE_START_LOG="$TMP_DIR/start.log"
 export FAKE_STOP_LOG="$TMP_DIR/stop.log"
 export FAKE_TOKEN_COUNT="$TMP_DIR/token-count"
+export FAKE_CHGRP_LOG="$TMP_DIR/chgrp.log"
+export FAKE_JOB_GROUP_MEMBERS='qa2-runner-host qoral-runner-host'
 export CREDENTIALS_DIRECTORY="$TMP_DIR/creds"
 printf '%s\n' 'PRIVATE_KEY_DO_NOT_LEAK' > "$CREDENTIALS_DIRECTORY/app-key"
 printf '0\n' > "$FAKE_START_FAILURES"
@@ -37,6 +39,7 @@ printf '0\n' > "$FAKE_TOKEN_COUNT"
 : > "$FAKE_SYSTEMCTL_ACTIVE"
 : > "$FAKE_START_LOG"
 : > "$FAKE_STOP_LOG"
+: > "$FAKE_CHGRP_LOG"
 
 cat > "$TMP_DIR/bin/curl" <<'FAKE_CURL'
 #!/usr/bin/env bash
@@ -85,6 +88,17 @@ elif [[ $method == GET && $path == */actions/runners\?* ]]; then
     repo_key=${repo//\//_}
     fixture="$FAKE_GITHUB_DIR/$repo_key.runners.json"
     [[ -r $fixture ]] && body=$(<"$fixture") || body='{"runners":[]}'
+elif [[ $method == GET && $path == */actions/jobs/* ]]; then
+    repo=${path#/repos/}
+    repo=${repo%%/actions/jobs/*}
+    repo_key=${repo//\//_}
+    fixture="$FAKE_GITHUB_DIR/$repo_key.job.${path##*/}.json"
+    if [[ -r $fixture ]]; then
+        body=$(<"$fixture")
+    else
+        status=404
+        body='{"message":"fake job not found"}'
+    fi
 elif [[ $method == DELETE && $path == */actions/runners/* ]]; then
     body='{}'
     status=204
@@ -184,7 +198,28 @@ fixture="$FAKE_JOURNAL_DIR/$unit.log"
 [[ -r $fixture ]] && cat "$fixture"
 exit 0
 FAKE_JOURNALCTL
-chmod +x "$TMP_DIR/bin/curl" "$TMP_DIR/bin/openssl" "$TMP_DIR/bin/systemctl" "$TMP_DIR/bin/journalctl"
+# The test user cannot join kvm-dispatcher-jobs, so group changes are recorded, and
+# membership is answered from FAKE_JOB_GROUP_MEMBERS.
+cat > "$TMP_DIR/bin/chgrp" <<'FAKE_CHGRP'
+#!/usr/bin/env bash
+set -o errexit -o nounset -o pipefail
+group=$1
+shift
+for path in "$@"; do
+    [[ -e $path ]] || { printf 'chgrp: missing %s\n' "$path" >&2; exit 1; }
+    printf '%s %s\n' "$group" "$path" >> "$FAKE_CHGRP_LOG"
+done
+FAKE_CHGRP
+cat > "$TMP_DIR/bin/id" <<'FAKE_ID'
+#!/usr/bin/env bash
+set -o errexit -o nounset -o pipefail
+[[ ${1:-} == -nG ]] || { printf 'unexpected fake id invocation\n' >&2; exit 2; }
+user=$2
+groups=$user
+[[ " $FAKE_JOB_GROUP_MEMBERS " == *" $user "* ]] && groups+=' kvm-dispatcher-jobs'
+printf '%s\n' "$groups"
+FAKE_ID
+chmod +x "$TMP_DIR/bin/curl" "$TMP_DIR/bin/openssl" "$TMP_DIR/bin/systemctl" "$TMP_DIR/bin/journalctl" "$TMP_DIR/bin/chgrp" "$TMP_DIR/bin/id"
 
 BASE_NOW=$(date -u -d '2026-01-01T00:00:00Z' +%s)
 export FAKE_TOKEN_EXPIRY=2026-01-01T01:00:00Z
@@ -218,6 +253,7 @@ clear_fixtures() {
     : > "$FAKE_START_LOG"
     : > "$FAKE_STOP_LOG"
     : > "$FAKE_ARGV_LOG"
+    : > "$FAKE_CHGRP_LOG"
     printf '0\n' > "$FAKE_START_FAILURES"
     printf '0\n' > "$FAKE_TOKEN_COUNT"
     rm -rf "$TMP_DIR/state" "$TMP_DIR/status"
@@ -286,10 +322,26 @@ set_runs qorraq_qoral pending '[{"id":201}]'
 set_jobs qorraq_qoral 201 '[{"id":2001,"status":"queued","created_at":"2026-01-01T00:00:01Z","labels":["self-hosted","linux","x64","qoral-kvm"]}]'
 run_dispatcher
 assert_contains "$(<"$FAKE_START_LOG")" 'qoral-runner-job@2001.service'
+[[ $(stat -c %a "$TMP_DIR/state") == 710 && $(stat -c %a "$TMP_DIR/state/jobs") == 710 ]] || fail 'runtime directories are not 0710'
+[[ $(stat -c %a "$TMP_DIR/state/tokens") == 700 ]] || fail 'installation token cache is not private'
+[[ $(stat -c %a "$TMP_DIR/state/jobs/2001") == 750 ]] || fail 'job directory is not 0750'
+[[ $(stat -c %a "$TMP_DIR/state/jobs/2001/github-token") == 640 ]] || fail 'job token is not 0640'
+[[ $(stat -c %a "$TMP_DIR/state/jobs/2001/state.json") == 600 ]] || fail 'job state is not private'
+for path in "$TMP_DIR/state" "$TMP_DIR/state/jobs" "$TMP_DIR/state/jobs/2001"; do
+    grep -Fxq "kvm-dispatcher-jobs $path" "$FAKE_CHGRP_LOG" || fail "$path was not given to kvm-dispatcher-jobs"
+done
+grep -Eq "^kvm-dispatcher-jobs $TMP_DIR/state/jobs/2001/\.github-token\." "$FAKE_CHGRP_LOG" || fail 'job token was not given to kvm-dispatcher-jobs before its rename'
 [[ $(wc -l < "$FAKE_START_LOG") -eq 1 ]] || fail 'capacity semaphore started more than one 12 GiB job'
 [[ $(jq '.queued | length' "$TMP_DIR/status/status.json") -eq 1 ]] || fail 'queued status did not separate the in-flight job from waiting jobs'
 [[ $(jq '.in_flight | length' "$TMP_DIR/status/status.json") -eq 1 ]] || fail 'status did not include the running job'
 jq -e 'keys == ["blocked","capacity_mib","in_flight","last_poll","queued","updated_at"] and .capacity_mib == 12288 and (.in_flight|type == "array") and (.queued|type == "array") and (.last_poll|type == "object") and (.blocked|type == "array")' "$TMP_DIR/status/status.json" >/dev/null || fail 'status.json shape is incorrect'
+
+# Startup refuses an adapter whose job user cannot read its token through the job group.
+clear_fixtures
+if FAKE_JOB_GROUP_MEMBERS=qa2-runner-host "$ROOT_DIR/host/kvm_dispatcher.sh" > "$TMP_DIR/output.log" 2>&1; then
+    fail 'dispatcher started although qoral-runner-host is not in kvm-dispatcher-jobs'
+fi
+assert_contains "$(<"$TMP_DIR/output.log")" 'usermod -aG kvm-dispatcher-jobs qoral-runner-host'
 
 # Configurable priority puts QA2 first even when its job is newer.
 clear_fixtures
@@ -383,6 +435,36 @@ run_dispatcher
 assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-finished unit=qa2-runner-job@1010.service exit=0 duration=90s memory_peak_mib=12'
 [[ ! -s $FAKE_START_LOG ]] || fail 'dispatcher relaunched a job ID after its runner unit had already run'
 jq -e '.blocked | any(.[]; .job_id == "1010" and .reason == "unit-already-ran")' "$TMP_DIR/status/status.json" >/dev/null || fail 'consumed queued job was not exposed as blocked'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-attribution-unknown repo=qniapp/qa2 job=1010'
+
+# The runner started for job X took the newer job Y. X was not run, so it returns to the
+# candidates and starts again instead of being blocked as unit-already-ran.
+clear_fixtures
+add_job_state qa2 qniapp/qa2 1017 qa2-runner-job@1017.service "$((BASE_NOW - 90))" 5400
+: > "$FAKE_SYSTEMCTL_ACTIVE"
+journal_minted qa2-runner-job@1017.service 81 qa2-kvm-20260101T000003Z-4244
+journal_deleted qa2-runner-job@1017.service 81
+set_runs qniapp_qa2 queued '[{"id":108}]'
+set_jobs qniapp_qa2 108 '[{"id":1017,"status":"queued","created_at":"2026-01-01T00:00:01Z","labels":["qa2-kvm"]}]'
+printf '{"id":1017,"status":"queued","runner_name":null}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.job.1017.json"
+printf '{"id":1018,"status":"completed","runner_name":"qa2-kvm-20260101T000003Z-4244"}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.job.1018.json"
+run_dispatcher
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-not-run repo=qniapp/qa2 job=1017 runner=qa2-kvm-20260101T000003Z-4244'
+assert_contains "$(<"$FAKE_START_LOG")" 'qa2-runner-job@1017.service'
+! jq -e '.blocked | any(.[]; .job_id == "1017")' "$TMP_DIR/status/status.json" >/dev/null || fail 'a job the runner did not run was blocked'
+
+# When the unit's own runner ran X, X is consumed and not relaunched.
+clear_fixtures
+add_job_state qa2 qniapp/qa2 1017 qa2-runner-job@1017.service "$((BASE_NOW - 90))" 5400
+: > "$FAKE_SYSTEMCTL_ACTIVE"
+journal_minted qa2-runner-job@1017.service 81 qa2-kvm-20260101T000003Z-4244
+journal_deleted qa2-runner-job@1017.service 81
+set_runs qniapp_qa2 queued '[{"id":108}]'
+set_jobs qniapp_qa2 108 '[{"id":1017,"status":"queued","created_at":"2026-01-01T00:00:01Z","labels":["qa2-kvm"]}]'
+printf '{"id":1017,"status":"queued","runner_name":"qa2-kvm-20260101T000003Z-4244"}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.job.1017.json"
+run_dispatcher
+[[ ! -s $FAKE_START_LOG ]] || fail 'dispatcher relaunched a job its own runner had run'
+jq -e '.blocked | any(.[]; .job_id == "1017" and .reason == "unit-already-ran")' "$TMP_DIR/status/status.json" >/dev/null || fail 'job run by the unit runner was not consumed'
 
 # A unit over its adapter limit is stopped, independent of GitHub visibility.
 clear_fixtures
@@ -444,6 +526,9 @@ export KVM_DISPATCHER_TEST_NOW=$((BASE_NOW + 3001))
 kvd_get_installation_token qniapp
 [[ $(<"$FAKE_TOKEN_COUNT") -eq 2 ]] || fail 'token was not refreshed with less than 10 minutes remaining'
 [[ $(<"$TMP_DIR/state/jobs/1009/github-token") == ghs_fake_token_secret_2 ]] || fail 'refreshed installation token was not made available to the running job'
+[[ $(stat -c %a "$TMP_DIR/state/jobs/1009/github-token") == 640 ]] || fail 'refreshed job token lost its 0640 mode'
+grep -Eq "^kvm-dispatcher-jobs $TMP_DIR/state/jobs/1009/\.github-token\." "$FAKE_CHGRP_LOG" || fail 'refreshed job token was not given to kvm-dispatcher-jobs before its rename'
+[[ -z $(find "$TMP_DIR/state/jobs/1009" -name '.github-token.*') ]] || fail 'token refresh left a temporary file'
 
 # GitHub failures back off 20/60/300 seconds while active units remain monitored.
 clear_fixtures
@@ -456,8 +541,9 @@ kvd_monitor_inflight
 [[ -z $(<"$FAKE_STOP_LOG") ]] || fail 'poll failure incorrectly cancelled an in-flight unit'
 [[ ${KVD_NEXT_POLL[qa2]} -eq $((BASE_NOW + 20)) ]] || fail 'first GitHub error backoff is not 20 seconds'
 export KVM_DISPATCHER_TEST_NOW=$((BASE_NOW + 19))
-kvd_poll_all
+kvd_poll_all > "$TMP_DIR/output.log"
 [[ ${KVD_POLL_FAILURES[qa2]} -eq 1 ]] || fail 'adapter was polled before its first backoff expired'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=poll-error repo=qniapp/qa2 skipped=true retry_in=1s'
 export KVM_DISPATCHER_TEST_NOW=$((BASE_NOW + 20))
 kvd_poll_all
 [[ ${KVD_NEXT_POLL[qa2]} -eq $((BASE_NOW + 80)) ]] || fail 'second GitHub error backoff is not 60 seconds'
