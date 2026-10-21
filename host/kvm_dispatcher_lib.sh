@@ -657,14 +657,11 @@ kvd_job_runner_identity() {
     KVD_RUNNER_DELETED=$KVD_JOURNAL_RUNNER_DELETED
 }
 
-# Sets KVD_RUNNER_BUSY for the registration named KVD_RUNNER_NAME.
-kvd_runner_busy() {
+# Succeeds only when the registration named KVD_RUNNER_NAME is online and not busy.
+kvd_runner_online_idle() {
     local adapter=$1
     kvd_list_runners "${KVD_A_INSTALLATION[$adapter]}" "${KVD_A_REPO[$adapter]}" || return 1
-    KVD_RUNNER_BUSY=false
-    if jq -e --arg name "$KVD_RUNNER_NAME" '.runners[]? | select(.name == $name and .busy == true)' <<< "$KVD_RUNNERS" >/dev/null; then
-        KVD_RUNNER_BUSY=true
-    fi
+    jq -e --arg name "$KVD_RUNNER_NAME" 'any(.runners[]?; .name == $name and .status == "online" and .busy == false)' <<< "$KVD_RUNNERS" >/dev/null
 }
 
 # Sets KVD_JOB_RAN_BY to the runner GitHub reports for a job, empty when none ran it.
@@ -953,20 +950,16 @@ kvd_monitor_inflight() {
         [[ ${KVD_REPO_OK[$adapter]:-0} == 1 ]] || continue
         status=$(jq -r --arg id "$job_id" '.[$id].status // "gone"' <<< "$KVD_JOB_MAP")
         [[ $status == completed || $status == gone ]] || continue
-        # A job that completed on this unit's runner leaves the unit to finish its cleanup.
-        # Only a job this runner did not run, while the runner is not busy with another
-        # job, is cancelled.
+        # A unit whose runner has run any job is left to finish its own cleanup. Only a
+        # runner that is online, idle, and not yet attributed to any job is cancelled.
         kvd_job_runner_identity "$adapter" "$job_id" "$unit" || continue
-        if [[ -n $KVD_RUNNER_NAME ]]; then
-            if [[ $status == gone ]]; then
-                kvd_fetch_job_runner "$adapter" "$job_id" || continue
-            else
-                KVD_JOB_RAN_BY=$(jq -r --arg id "$job_id" '.[$id].runner_name // ""' <<< "$KVD_JOB_MAP")
-            fi
+        [[ -n $KVD_RUNNER_NAME ]] || continue
+        jq -e --arg name "$KVD_RUNNER_NAME" 'any(.[]; .runner_name == $name)' <<< "$KVD_JOB_MAP" >/dev/null && continue
+        if [[ $status == gone ]]; then
+            kvd_fetch_job_runner "$adapter" "$job_id" || continue
             [[ $KVD_JOB_RAN_BY == "$KVD_RUNNER_NAME" ]] && continue
-            kvd_runner_busy "$adapter" || continue
-            [[ $KVD_RUNNER_BUSY == true ]] && continue
         fi
+        kvd_runner_online_idle "$adapter" || continue
         if systemctl stop "$unit"; then
             kvd_record_job_finished "$job_id" cancelled
             kvd_mark_job_consumed "$job_id"

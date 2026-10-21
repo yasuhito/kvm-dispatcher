@@ -476,6 +476,35 @@ printf '{"runners":[{"id":84,"name":"qa2-kvm-20260101T000006Z-4247","status":"on
 run_dispatcher
 [[ ! -s $FAKE_STOP_LOG ]] || fail 'a unit whose runner was busy with another job was stopped as cancelled'
 
+# Push A dispatches X; push B cancels X and queues Y, which the unit's runner picks up.
+# After Y finishes, X is gone and the runner is offline, so the unit is still left to
+# clean up. When it exits, X is attributed as not run instead of consumed.
+clear_fixtures
+add_job_state qa2 qniapp/qa2 1022 qa2-runner-job@1022.service "$((BASE_NOW - 600))" 5400
+journal_minted qa2-runner-job@1022.service 85 qa2-kvm-20260101T000007Z-4248
+printf '{"id":1022,"status":"completed","conclusion":"cancelled","runner_name":null}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.job.1022.json"
+set_runs qniapp_qa2 in_progress '[{"id":111}]'
+set_jobs qniapp_qa2 111 '[{"id":1023,"status":"in_progress","runner_name":"qa2-kvm-20260101T000007Z-4248","labels":["qa2-kvm"]}]'
+printf '{"runners":[{"id":85,"name":"qa2-kvm-20260101T000007Z-4248","status":"online","busy":true}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+run_dispatcher
+[[ ! -s $FAKE_STOP_LOG ]] || fail 'the unit was stopped while its runner ran Y'
+set_runs qniapp_qa2 in_progress '[]'
+printf '{"runners":[{"id":85,"name":"qa2-kvm-20260101T000007Z-4248","status":"offline","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+export KVM_DISPATCHER_TEST_NOW=$((BASE_NOW + 20))
+run_dispatcher
+[[ ! -s $FAKE_STOP_LOG ]] || fail 'the unit was stopped during cleanup after its runner ran Y'
+grep -Fxq 'qa2-runner-job@1022.service' "$FAKE_SYSTEMCTL_ACTIVE" || fail 'the unit cleaning up after Y is no longer active'
+: > "$FAKE_SYSTEMCTL_ACTIVE"
+export KVM_DISPATCHER_TEST_NOW=$((BASE_NOW + 40))
+run_dispatcher
+[[ ! -s $FAKE_STOP_LOG ]] || fail 'the exited unit was stopped'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-finished unit=qa2-runner-job@1022.service'
+assert_contains "$(<"$TMP_DIR/output.log")" 'outcome=done'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-not-run repo=qniapp/qa2 job=1022'
+! jq -e '.blocked | any(.[]; .job_id == "1022")' "$TMP_DIR/status/status.json" >/dev/null || fail 'X was consumed although the runner ran Y'
+! jq -e '.consumed == true' "$TMP_DIR/status/attempts/1022.json" >/dev/null 2>&1 || fail 'X has a consumed record although the runner ran Y'
+export KVM_DISPATCHER_TEST_NOW=$BASE_NOW
+
 # Per-job SWEPT leaves the registration alone when the script logged its own DELETE.
 clear_fixtures
 add_job_state qa2 qniapp/qa2 1015 qa2-runner-job@1015.service "$((BASE_NOW - 60))" 5400
