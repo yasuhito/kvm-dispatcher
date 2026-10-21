@@ -591,14 +591,20 @@ kvd_unit_memory_peak_mib() {
     fi
 }
 
-kvd_set_job_phase() {
-    local job_id=$1 phase=$2 state_file tmp
+kvd_update_job_state() {
+    local job_id=$1 filter=$2 state_file tmp
+    shift 2
     state_file="$KVD_STATE_DIR/jobs/$job_id/state.json"
     [[ -r $state_file ]] || return 0
     tmp=$(mktemp "$KVD_STATE_DIR/jobs/$job_id/.state.XXXXXX")
-    jq -c --arg phase "$phase" '.phase = $phase' "$state_file" > "$tmp"
+    jq -c "$@" "$filter" "$state_file" > "$tmp"
     chmod 0600 "$tmp"
     mv -f "$tmp" "$state_file"
+}
+
+kvd_set_job_phase() {
+    # shellcheck disable=SC2016
+    kvd_update_job_state "$1" '.phase = $phase' --arg phase "$2"
 }
 
 kvd_mark_job_running() {
@@ -948,16 +954,24 @@ kvd_monitor_inflight() {
         fi
 
         [[ ${KVD_REPO_OK[$adapter]:-0} == 1 ]] || continue
-        status=$(jq -r --arg id "$job_id" '.[$id].status // "gone"' <<< "$KVD_JOB_MAP")
-        [[ $status == completed || $status == gone ]] || continue
-        # A unit whose runner has run any job is left to finish its own cleanup. Only a
-        # runner that is online, idle, and not yet attributed to any job is cancelled.
+        # A unit whose runner has ever been attributed to any job is left to finish its own
+        # cleanup. The attribution is persisted in state.json because a completed job's run
+        # later leaves the polled list.
+        [[ $(jq -r '.runner_attributed // false' "$state_file") == true ]] && continue
         kvd_job_runner_identity "$adapter" "$job_id" "$unit" || continue
         [[ -n $KVD_RUNNER_NAME ]] || continue
-        jq -e --arg name "$KVD_RUNNER_NAME" 'any(.[]; .runner_name == $name)' <<< "$KVD_JOB_MAP" >/dev/null && continue
+        if jq -e --arg name "$KVD_RUNNER_NAME" 'any(.[]; .runner_name == $name)' <<< "$KVD_JOB_MAP" >/dev/null; then
+            kvd_update_job_state "$job_id" '.runner_attributed = true'
+            continue
+        fi
+        status=$(jq -r --arg id "$job_id" '.[$id].status // "gone"' <<< "$KVD_JOB_MAP")
+        [[ $status == completed || $status == gone ]] || continue
         if [[ $status == gone ]]; then
             kvd_fetch_job_runner "$adapter" "$job_id" || continue
-            [[ $KVD_JOB_RAN_BY == "$KVD_RUNNER_NAME" ]] && continue
+            if [[ $KVD_JOB_RAN_BY == "$KVD_RUNNER_NAME" ]]; then
+                kvd_update_job_state "$job_id" '.runner_attributed = true'
+                continue
+            fi
         fi
         kvd_runner_online_idle "$adapter" || continue
         if systemctl stop "$unit"; then

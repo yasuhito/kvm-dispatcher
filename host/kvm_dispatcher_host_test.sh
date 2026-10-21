@@ -489,8 +489,12 @@ printf '{"runners":[{"id":85,"name":"qa2-kvm-20260101T000007Z-4248","status":"on
 run_dispatcher
 [[ ! -s $FAKE_STOP_LOG ]] || fail 'the unit was stopped while its runner ran Y'
 set_runs qniapp_qa2 in_progress '[]'
-printf '{"runners":[{"id":85,"name":"qa2-kvm-20260101T000007Z-4248","status":"offline","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+printf '{"runners":[{"id":85,"name":"qa2-kvm-20260101T000007Z-4248","status":"online","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
 export KVM_DISPATCHER_TEST_NOW=$((BASE_NOW + 20))
+run_dispatcher
+[[ ! -s $FAKE_STOP_LOG ]] || fail 'the unit was stopped after Y left the polled list while its registration still looked online and idle'
+printf '{"runners":[{"id":85,"name":"qa2-kvm-20260101T000007Z-4248","status":"offline","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+export KVM_DISPATCHER_TEST_NOW=$((BASE_NOW + 30))
 run_dispatcher
 [[ ! -s $FAKE_STOP_LOG ]] || fail 'the unit was stopped during cleanup after its runner ran Y'
 grep -Fxq 'qa2-runner-job@1022.service' "$FAKE_SYSTEMCTL_ACTIVE" || fail 'the unit cleaning up after Y is no longer active'
