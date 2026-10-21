@@ -28,7 +28,7 @@ The lifecycle is:
 2. `CLAIMED`: the installation token is copied to `/run/kvm-dispatcher/jobs/<job-id>/github-token` and state is recorded.
 3. `STARTED`, then `RUNNING`: start `<adapter-unit>@<job-id>.service` and monitor it.
 4. `DONE`: the unit exits. Record exit status, duration, and `memory_peak_mib`.
-5. `CANCELLED`: if a job is no longer queued or in progress and the unit's runner either was never minted or is still registered but idle, stop its unit. A JIT registration disappears once its runner has run a job, so a missing registration means the worker is finishing its own cleanup and is left to exit, with `MAX_UNIT_SECONDS` as the limit.
+5. `CANCELLED`: if a job is completed or no longer listed, the dispatcher asks GitHub which runner ran it, from the polled job or `GET /actions/jobs/<id>`. When it ran on this unit's runner, the unit is left to finish its cleanup, with `MAX_UNIT_SECONDS` as the limit. Otherwise the unit is stopped, unless its runner is busy with another job.
 6. `STUCK`: stop an active unit after its adapter's `MAX_UNIT_SECONDS` limit. `CANCELLED` and `STUCK` units also record exit status, duration, and `memory_peak_mib` after they stop.
 7. `FAILED`: a failed systemd start is retried after 300 seconds. Three start failures block that job ID until an operator clears its attempt record.
 8. `SWEPT`: if the job script did not delete its own registration, use a newly minted installation token to delete it, then remove that job's runtime state.

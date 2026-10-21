@@ -406,7 +406,7 @@ kvd_poll_adapter() {
                         job_id=$(jq -r '.id | tostring' <<< "$job_json")
                         [[ $job_id =~ ^[0-9]+$ ]] || continue
                         job_status=$(jq -r '.status // "unknown"' <<< "$job_json")
-                        printf '%s\n' "$(jq -cn --arg adapter "$adapter" --arg repo "$repo" --arg job_id "$job_id" --arg status "$job_status" '{adapter:$adapter,repo:$repo,job_id:$job_id,status:$status}')" >> "$KVD_JOB_LINES"
+                        printf '%s\n' "$(jq -cn --arg adapter "$adapter" --arg repo "$repo" --arg job_id "$job_id" --arg status "$job_status" --arg runner_name "$(jq -r '.runner_name // ""' <<< "$job_json")" '{adapter:$adapter,repo:$repo,job_id:$job_id,status:$status,runner_name:$runner_name}')" >> "$KVD_JOB_LINES"
                         if [[ $job_status == queued ]] && kvd_labels_match "$adapter" "$job_json"; then
                             created_at=$(jq -r '.created_at // empty' <<< "$job_json")
                             [[ -n $created_at ]] || created_at=$(jq -r '.run_started_at // empty' <<< "$run_json")
@@ -657,18 +657,21 @@ kvd_job_runner_identity() {
     KVD_RUNNER_DELETED=$KVD_JOURNAL_RUNNER_DELETED
 }
 
-# KVD_RUNNER_STATE is unidentified (no runner minted yet), busy, idle (registered and
-# waiting), or absent. A JIT registration exists from minting until its one job ends,
-# so an absent registration means the runner already ran a job and the unit is cleaning up.
-kvd_runner_state() {
-    local adapter=$1 job_id=$2 unit=$3 installation=${KVD_A_INSTALLATION[$1]} repo=${KVD_A_REPO[$1]}
-    kvd_job_runner_identity "$adapter" "$job_id" "$unit" || return 1
-    KVD_RUNNER_STATE=unidentified
-    [[ -n $KVD_RUNNER_NAME ]] || return 0
-    kvd_list_runners "$installation" "$repo" || return 1
-    KVD_RUNNER_STATE=$(jq -r --arg name "$KVD_RUNNER_NAME" '
-      [.runners[]? | select(.name == $name)]
-      | if length == 0 then "absent" elif any(.[]; .busy == true) then "busy" else "idle" end' <<< "$KVD_RUNNERS")
+# Sets KVD_RUNNER_BUSY for the registration named KVD_RUNNER_NAME.
+kvd_runner_busy() {
+    local adapter=$1
+    kvd_list_runners "${KVD_A_INSTALLATION[$adapter]}" "${KVD_A_REPO[$adapter]}" || return 1
+    KVD_RUNNER_BUSY=false
+    if jq -e --arg name "$KVD_RUNNER_NAME" '.runners[]? | select(.name == $name and .busy == true)' <<< "$KVD_RUNNERS" >/dev/null; then
+        KVD_RUNNER_BUSY=true
+    fi
+}
+
+# Sets KVD_JOB_RAN_BY to the runner GitHub reports for a job, empty when none ran it.
+kvd_fetch_job_runner() {
+    local adapter=$1 job_id=$2
+    kvd_github_request "${KVD_A_INSTALLATION[$adapter]}" GET "/repos/${KVD_A_REPO[$adapter]}/actions/jobs/$job_id" || return 1
+    KVD_JOB_RAN_BY=$(jq -er '.runner_name // ""' <<< "$KVD_BODY")
 }
 
 kvd_sweep_job() {
@@ -776,15 +779,14 @@ kvd_mark_start_failure() {
 # counts as a start failure, so it returns to the candidates after the 300-second retry
 # and is blocked on the third strike. Unknown attribution keeps the job consumed.
 kvd_mark_job_consumed() {
-    local job_id=$1 state_file="$KVD_STATE_DIR/jobs/$1/state.json" attempt_file adapter repo unit tmp ran_by reason
+    local job_id=$1 state_file="$KVD_STATE_DIR/jobs/$1/state.json" attempt_file adapter repo unit tmp reason
     [[ -r $state_file ]] || return 0
     adapter=$(jq -r '.adapter' "$state_file")
     repo=$(jq -r '.repo' "$state_file")
     unit=$(jq -r '.unit' "$state_file")
     if kvd_job_runner_identity "$adapter" "$job_id" "$unit" && [[ -n $KVD_RUNNER_NAME ]] &&
-        kvd_github_request "${KVD_A_INSTALLATION[$adapter]}" GET "/repos/$repo/actions/jobs/$job_id" &&
-        ran_by=$(jq -er '.runner_name // ""' <<< "$KVD_BODY"); then
-        if [[ $ran_by != "$KVD_RUNNER_NAME" ]]; then
+        kvd_fetch_job_runner "$adapter" "$job_id"; then
+        if [[ $KVD_JOB_RAN_BY != "$KVD_RUNNER_NAME" ]]; then
             reason=runner-idle
             [[ $(kvd_unit_exit_status "$unit") == 0 ]] || reason=exit-nonzero
             kvd_log "job-not-run repo=$repo job=$job_id runner=$KVD_RUNNER_NAME reason=$reason"
@@ -950,17 +952,27 @@ kvd_monitor_inflight() {
 
         [[ ${KVD_REPO_OK[$adapter]:-0} == 1 ]] || continue
         status=$(jq -r --arg id "$job_id" '.[$id].status // "gone"' <<< "$KVD_JOB_MAP")
-        if [[ $status != queued && $status != in_progress ]]; then
-            if kvd_runner_state "$adapter" "$job_id" "$unit" &&
-                [[ $KVD_RUNNER_STATE == unidentified || $KVD_RUNNER_STATE == idle ]]; then
-                if systemctl stop "$unit"; then
-                    kvd_record_job_finished "$job_id" cancelled
-                    kvd_mark_job_consumed "$job_id"
-                    kvd_set_job_phase "$job_id" CANCELLED
-                    kvd_log "job-cancelled unit=$unit"
-                    kvd_sweep_job "$job_id" || true
-                fi
+        [[ $status == completed || $status == gone ]] || continue
+        # A job that completed on this unit's runner leaves the unit to finish its cleanup.
+        # Only a job this runner did not run, while the runner is not busy with another
+        # job, is cancelled.
+        kvd_job_runner_identity "$adapter" "$job_id" "$unit" || continue
+        if [[ -n $KVD_RUNNER_NAME ]]; then
+            if [[ $status == gone ]]; then
+                kvd_fetch_job_runner "$adapter" "$job_id" || continue
+            else
+                KVD_JOB_RAN_BY=$(jq -r --arg id "$job_id" '.[$id].runner_name // ""' <<< "$KVD_JOB_MAP")
             fi
+            [[ $KVD_JOB_RAN_BY == "$KVD_RUNNER_NAME" ]] && continue
+            kvd_runner_busy "$adapter" || continue
+            [[ $KVD_RUNNER_BUSY == true ]] && continue
+        fi
+        if systemctl stop "$unit"; then
+            kvd_record_job_finished "$job_id" cancelled
+            kvd_mark_job_consumed "$job_id"
+            kvd_set_job_phase "$job_id" CANCELLED
+            kvd_log "job-cancelled unit=$unit"
+            kvd_sweep_job "$job_id" || true
         fi
     done
 }

@@ -427,12 +427,13 @@ unset FAKE_HTTP_FAIL_MATCH
 assert_contains "$(<"$FAKE_START_LOG")" 'qa2-runner-job@1014.service'
 assert_contains "$(<"$TMP_DIR/output.log")" 'event=poll-error http=500 repo=qorraq/qoral'
 
-# A vanished job whose runner is still registered but idle stops its unit, records its
+# A vanished job that GitHub reports no runner ran stops its idle unit, records its
 # outcome, and deletes the registration named in its journal, because the script did not
 # log its own successful DELETE.
 clear_fixtures
 add_job_state qa2 qniapp/qa2 1006 qa2-runner-job@1006.service "$BASE_NOW" 5400
 journal_minted qa2-runner-job@1006.service 77 qa2-kvm-20260101T000001Z-4242
+printf '{"id":1006,"status":"completed","conclusion":"cancelled","runner_name":null}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.job.1006.json"
 printf '{"runners":[{"id":77,"name":"qa2-kvm-20260101T000001Z-4242","status":"online","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
 run_dispatcher
 assert_contains "$(<"$FAKE_STOP_LOG")" 'qa2-runner-job@1006.service'
@@ -441,14 +442,39 @@ assert_contains "$(<"$FAKE_ARGV_LOG")" '/repos/qniapp/qa2/actions/runners/77'
 [[ ! -e $TMP_DIR/state/jobs/1006 ]] || fail 'cancelled job state was not swept'
 assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-finished unit=qa2-runner-job@1006.service exit=0 duration=0s memory_peak_mib=12 outcome=cancelled'
 
-# A job that completed on the unit's own runner leaves no registration behind. The unit is
-# still cleaning up its guest, so it is not stopped as cancelled.
+# A job that completed on the unit's own runner is not cancelled while the unit cleans up
+# its guest, even though the idle registration lingers until the script deletes it. The
+# vanished job is confirmed through GET /actions/jobs/<id>.
 clear_fixtures
 add_job_state qa2 qniapp/qa2 1019 qa2-runner-job@1019.service "$((BASE_NOW - 600))" 5400
 journal_minted qa2-runner-job@1019.service 82 qa2-kvm-20260101T000004Z-4245
+printf '{"id":1019,"status":"completed","conclusion":"success","runner_name":"qa2-kvm-20260101T000004Z-4245"}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.job.1019.json"
+printf '{"runners":[{"id":82,"name":"qa2-kvm-20260101T000004Z-4245","status":"offline","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
 run_dispatcher
 [[ ! -s $FAKE_STOP_LOG ]] || fail 'a unit cleaning up after its completed job was stopped as cancelled'
 grep -Fxq 'qa2-runner-job@1019.service' "$FAKE_SYSTEMCTL_ACTIVE" || fail 'the finishing unit is no longer active'
+assert_contains "$(<"$FAKE_ARGV_LOG")" '/repos/qniapp/qa2/actions/jobs/1019'
+
+# The same holds when the poll still lists the job as completed with this runner's name.
+clear_fixtures
+add_job_state qa2 qniapp/qa2 1020 qa2-runner-job@1020.service "$((BASE_NOW - 600))" 5400
+journal_minted qa2-runner-job@1020.service 83 qa2-kvm-20260101T000005Z-4246
+set_runs qniapp_qa2 in_progress '[{"id":109}]'
+set_jobs qniapp_qa2 109 '[{"id":1020,"status":"completed","conclusion":"success","runner_name":"qa2-kvm-20260101T000005Z-4246","labels":["qa2-kvm"]}]'
+printf '{"runners":[{"id":83,"name":"qa2-kvm-20260101T000005Z-4246","status":"online","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+run_dispatcher
+[[ ! -s $FAKE_STOP_LOG ]] || fail 'a unit whose runner completed the listed job was stopped as cancelled'
+
+# A dispatching job that completed without this runner is not cancelled while the runner
+# is busy with another job.
+clear_fixtures
+add_job_state qa2 qniapp/qa2 1021 qa2-runner-job@1021.service "$((BASE_NOW - 600))" 5400
+journal_minted qa2-runner-job@1021.service 84 qa2-kvm-20260101T000006Z-4247
+set_runs qniapp_qa2 in_progress '[{"id":110}]'
+set_jobs qniapp_qa2 110 '[{"id":1021,"status":"completed","conclusion":"cancelled","runner_name":"","labels":["qa2-kvm"]}]'
+printf '{"runners":[{"id":84,"name":"qa2-kvm-20260101T000006Z-4247","status":"online","busy":true}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+run_dispatcher
+[[ ! -s $FAKE_STOP_LOG ]] || fail 'a unit whose runner was busy with another job was stopped as cancelled'
 
 # Per-job SWEPT leaves the registration alone when the script logged its own DELETE.
 clear_fixtures
