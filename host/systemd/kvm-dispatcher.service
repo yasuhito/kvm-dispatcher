@@ -1,0 +1,32 @@
+[Unit]
+Description=GitHub Actions KVM runner dispatcher
+Documentation=https://github.com/yasuhito/kvm-dispatcher
+After=network-online.target systemd-tmpfiles-setup.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kvm-dispatcher
+Group=kvm-dispatcher
+SupplementaryGroups=systemd-journal
+EnvironmentFile=/etc/kvm-dispatcher/dispatcher.conf
+Environment=KVM_DISPATCHER_CONFIG=/etc/kvm-dispatcher/dispatcher.conf
+ExecStart=/opt/kvm-dispatcher/host/kvm_dispatcher.sh
+Restart=always
+RestartSec=5s
+UMask=0077
+RuntimeDirectory=kvm-dispatcher
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
+StateDirectory=kvm-dispatcher
+StateDirectoryMode=0755
+LoadCredentialEncrypted=app-key:/etc/kvm-dispatcher/app-key.cred
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
