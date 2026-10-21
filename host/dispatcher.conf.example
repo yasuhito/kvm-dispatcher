@@ -1,0 +1,20 @@
+# Copy to /etc/kvm-dispatcher/dispatcher.conf and set the App and installation IDs.
+# This file is sourced by bash. Keep it root-owned and not writable by the service.
+KVM_DISPATCHER_APP_ID=5405924
+KVM_DISPATCHER_INSTALLATION_QNIAPP=173623654
+KVM_DISPATCHER_INSTALLATION_QORRAQ=173623739
+KVM_DISPATCHER_INSTALLATIONS="qniapp qorraq"
+KVM_DISPATCHER_REPOSITORY_QNIAPP=qniapp/qa2
+KVM_DISPATCHER_REPOSITORY_QORRAQ=qorraq/qoral
+
+# One 12 GiB guest at a time on the Beelink.
+KVM_DISPATCHER_CAPACITY_MIB=12288
+KVM_DISPATCHER_POLL_SECONDS=20
+
+# Empty means global FIFO by created_at. Set to qa2 to put QA2 jobs first
+# whenever QA2 has queued work. Other jobs remain FIFO behind it.
+KVM_DISPATCHER_PRIORITY=
+
+KVM_DISPATCHER_REPOS_DIR=/etc/kvm-dispatcher/repos.d
+KVM_DISPATCHER_STATE_DIR=/run/kvm-dispatcher
+KVM_DISPATCHER_STATUS_FILE=/var/lib/kvm-dispatcher/status.json

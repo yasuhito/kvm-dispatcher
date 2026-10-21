@@ -1,0 +1,12 @@
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" || subject.user !== "kvm-dispatcher") {
+        return;
+    }
+
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    var allowedUnit = /^(qa2|qoral|qa2-agent-loop)-runner-job@[0-9a-z-]+\.service$/;
+    if ((verb === "start" || verb === "stop") && unit && allowedUnit.test(unit)) {
+        return polkit.Result.YES;
+    }
+});
