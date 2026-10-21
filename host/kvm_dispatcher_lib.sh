@@ -751,7 +751,7 @@ kvd_record_job_finished() {
 # is reported and read as empty; the next finished job rewrites the file.
 kvd_recent_jobs() {
     [[ -e $KVD_RECENT_FILE ]] || { printf '[]\n'; return 0; }
-    jq -ce 'if type == "array" and all(.[]; type == "object") then . else error end' "$KVD_RECENT_FILE" 2>/dev/null && return 0
+    jq -cse 'if length == 1 and (.[0] | type == "array" and all(.[]; type == "object")) then .[0] else error end' "$KVD_RECENT_FILE" 2>/dev/null && return 0
     kvd_log "recent-history-invalid file=$KVD_RECENT_FILE" >&2
     printf '[]\n'
 }

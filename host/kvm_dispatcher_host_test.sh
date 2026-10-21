@@ -563,9 +563,10 @@ run_dispatcher
 jq -e '.recent | length == 20 and ([.[].job_id] == ([range(3021; 3001; -1)] | map(tostring)))' "$TMP_DIR/status/status.json" >/dev/null || fail 'recent history is not the newest 20 jobs, newest first, after a restart'
 jq -e '.recent[0] == {"repo":"qniapp/qa2","job_id":"3021","unit":"qa2-runner-job@3021.service","outcome":"stuck","started_at":"2026-01-01T00:00:00Z","finished_at":"2026-01-01T00:00:21Z","duration_s":21,"memory_peak_mib":null,"exit_status":null}' "$TMP_DIR/status/status.json" >/dev/null || fail 'recent entry with an unknown exit status and memory peak is not null'
 
-# An empty, truncated, or wrong-shaped recent history neither stops dispatch nor blocks a
-# finished job's transition; it reads as empty and the next finished job rewrites it.
-for corrupt in '' '[{"repo":"qniapp/qa2"' '{"recent":[]}' '[1]'; do
+# An empty, truncated, concatenated, or wrong-shaped recent history neither stops dispatch
+# nor blocks a finished job's transition; it reads as empty and the next finished job
+# rewrites it.
+for corrupt in '' '[{"repo":"qniapp/qa2"' $'[]\n[]' '{"recent":[]}' '[1]'; do
     clear_fixtures
     printf '%s' "$corrupt" > "$TMP_DIR/status/recent.json"
     add_job_state qa2 qniapp/qa2 1030 qa2-runner-job@1030.service "$((BASE_NOW - 30))" 5400

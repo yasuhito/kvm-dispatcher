@@ -95,7 +95,7 @@ jq . /var/lib/kvm-dispatcher/status.json
 }
 ```
 
-`memory_peak_mib` is the largest cgroup `memory.peak` sampled so far, in MiB, or `null` before any sample. `recent` holds the newest 20 finished jobs, newest first, with `outcome` `done`, `cancelled`, or `stuck`; `exit_status` is `null` when systemd did not report one. The history is kept in `/var/lib/kvm-dispatcher/recent.json`, so it survives dispatcher restarts and reboots. If that file is not a JSON array of objects, the dispatcher logs `recent-history-invalid` and treats the history as empty until the next finished job rewrites it.
+`memory_peak_mib` is the largest cgroup `memory.peak` sampled so far, in MiB, or `null` before any sample. `recent` holds the newest 20 finished jobs, newest first, with `outcome` `done`, `cancelled`, or `stuck`; `exit_status` is `null` when systemd did not report one. The history is kept in `/var/lib/kvm-dispatcher/recent.json`, so it survives dispatcher restarts and reboots. If that file is not exactly one JSON array of objects, the dispatcher logs `recent-history-invalid` and treats the history as empty until the next finished job rewrites it.
 
 The `queued` list omits jobs already claimed by a unit. `in_flight` includes only active units. A three-strike start failure can be retried by removing its JSON record from `/var/lib/kvm-dispatcher/attempts/` after investigating the failure. A `unit-already-ran` record means a worker unit ran that job, or its runner could not be attributed, while GitHub still reports the job queued; the dispatcher will not start the same job ID again, so rerun the workflow or remove that record only after investigating.
 
