@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=simple
 User=kvm-dispatcher
 Group=kvm-dispatcher
+SupplementaryGroups=systemd-journal
 EnvironmentFile=/etc/kvm-dispatcher/dispatcher.conf
 Environment=KVM_DISPATCHER_CONFIG=/etc/kvm-dispatcher/dispatcher.conf
 ExecStart=/opt/kvm-dispatcher/host/kvm_dispatcher.sh

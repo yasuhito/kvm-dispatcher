@@ -10,7 +10,6 @@ KVD_BODY=
 KVD_TOKEN=
 KVD_QUEUE='[]'
 KVD_JOB_MAP='{}'
-KVD_POLLS_OK=1
 KVD_LAST_POLL_JSON='{}'
 declare -ag KVD_ADAPTER_NAMES=()
 declare -Ag KVD_A_REPO=()
@@ -124,7 +123,7 @@ kvd_load_config() {
         [[ $KVM_DISPATCHER_REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || kvd_die "invalid repository in $conf"
         [[ $KVM_DISPATCHER_INSTALLATION =~ ^[a-zA-Z0-9_-]+$ ]] || kvd_die "invalid installation alias in $conf"
         [[ $KVM_DISPATCHER_LABELS =~ ^[A-Za-z0-9_.-]+([,[:space:]]+[A-Za-z0-9_.-]+)*$ ]] || kvd_die "invalid labels in $conf"
-        [[ $KVM_DISPATCHER_UNIT =~ ^(qa2|qoral|qa2-agent-loop)-runner-job@$ ]] || kvd_die "unit prefix is not permitted in $conf"
+        [[ $KVM_DISPATCHER_UNIT =~ ^(qa2|qoral)-runner-job@$ ]] || kvd_die "unit prefix is not permitted in $conf"
         [[ $KVM_DISPATCHER_RUNNER_NAME_PREFIX =~ ^[A-Za-z0-9_.-]+$ ]] || kvd_die "invalid runner name prefix in $conf"
         kvd_positive_integer "$KVM_DISPATCHER_MAX_UNIT_SECONDS" || kvd_die "invalid max unit time in $conf"
         kvd_positive_integer "$KVM_DISPATCHER_MEMORY_MIB" || kvd_die "invalid memory in $conf"
@@ -340,7 +339,6 @@ kvd_poll_adapter() {
     local now runs_count jobs_count jobs_url
     now=$(kvd_now)
     if (( now < ${KVD_NEXT_POLL[$adapter]:-0} )); then
-        KVD_POLLS_OK=0
         KVD_REPO_OK[$adapter]=0
         return 0
     fi
@@ -407,9 +405,8 @@ kvd_poll_adapter() {
 kvd_probe_installations() {
     local installation key repo_variable repo now delay failures
     now=$(kvd_now)
-    KVD_POLLS_OK=1
     for installation in "${KVD_INSTALLATIONS[@]}"; do
-        (( now >= ${KVD_PROBE_NEXT_POLL[$installation]:-0} )) || { KVD_POLLS_OK=0; continue; }
+        (( now >= ${KVD_PROBE_NEXT_POLL[$installation]:-0} )) || continue
         key=${installation^^}
         key=${key//-/_}
         repo_variable="KVM_DISPATCHER_REPOSITORY_${key}"
@@ -428,7 +425,6 @@ kvd_probe_installations() {
                 *) delay=300 ;;
             esac
             KVD_PROBE_NEXT_POLL[$installation]=$((now + delay))
-            KVD_POLLS_OK=0
             kvd_record_poll "$repo" "$KVD_HTTP" "$(kvd_iso_now)"
             kvd_log "poll-error http=$KVD_HTTP repo=$repo retry_in=${delay}s"
         fi
@@ -502,8 +498,7 @@ kvd_prune_discovered_jobs() {
 }
 
 kvd_poll_all() {
-    local adapter tmp_jobs tmp_queue priority
-    KVD_POLLS_OK=1
+    local adapter tmp_jobs tmp_queue priority healthy
     KVD_REPO_OK=()
     KVD_JOB_MAP='{}'
     tmp_jobs=$(mktemp "$KVD_STATE_DIR/jobs-map.XXXXXX")
@@ -520,18 +515,21 @@ kvd_poll_all() {
     fi
 
     for adapter in "${KVD_ADAPTER_NAMES[@]}"; do
-        if ! kvd_poll_adapter "$adapter"; then
-            KVD_POLLS_OK=0
-        fi
-        if [[ ${KVD_REPO_OK[$adapter]:-0} != 1 ]]; then
-            KVD_POLLS_OK=0
-        fi
+        kvd_poll_adapter "$adapter" || true
     done
 
+    # Only adapters with a complete poll this round contribute jobs, so one failing
+    # installation does not hold back FIFO scheduling for the others.
+    healthy=$(for adapter in "${KVD_ADAPTER_NAMES[@]}"; do
+        if [[ ${KVD_REPO_OK[$adapter]:-0} == 1 ]]; then
+            printf '%s\n' "$adapter"
+        fi
+    done | jq -Rsc 'split("\n") | map(select(length > 0))')
     KVD_JOB_MAP=$(jq -cs 'reduce .[] as $item ({}; .[$item.job_id] = $item)' "$tmp_jobs")
     priority=$KVD_PRIORITY
-    KVD_QUEUE=$(jq -cs --arg priority "$priority" '
-      unique_by(.job_id)
+    KVD_QUEUE=$(jq -cs --arg priority "$priority" --argjson healthy "$healthy" '
+      map(select(.adapter | IN($healthy[])))
+      | unique_by(.job_id)
       | sort_by([if ($priority != "" and (.adapter == $priority or .repo == $priority)) then 0 else 1 end, .created_at, (.job_id | tonumber)])
     ' "$tmp_queue")
     rm -f "$tmp_jobs" "$tmp_queue"
@@ -596,24 +594,61 @@ kvd_mark_job_running() {
     mv -f "$tmp" "$state_file"
 }
 
+# Job scripts name their own runners and log `event=jitconfig-minted runner_id=N
+# runner_name=NAME` and, after their own cleanup, `event=runner-deleted runner_id=N`.
+kvd_unit_journal_runner() {
+    local unit=$1 journal line minted_id='' deleted_id=''
+    KVD_JOURNAL_RUNNER_NAME=''
+    KVD_JOURNAL_RUNNER_DELETED=false
+    journal=$(journalctl --unit="$unit" --output=cat --no-pager --quiet 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        if [[ $line =~ (^|[[:space:]])event=jitconfig-minted[[:space:]]+runner_id=([0-9]+)[[:space:]]+runner_name=([A-Za-z0-9_.-]+)([[:space:]]|$) ]]; then
+            minted_id=${BASH_REMATCH[2]}
+            KVD_JOURNAL_RUNNER_NAME=${BASH_REMATCH[3]}
+            KVD_JOURNAL_RUNNER_DELETED=false
+        elif [[ $line =~ (^|[[:space:]])event=runner-deleted[[:space:]]+runner_id=([0-9]+)([[:space:]]|$) ]]; then
+            deleted_id=${BASH_REMATCH[2]}
+            [[ -n $minted_id && $deleted_id == "$minted_id" ]] && KVD_JOURNAL_RUNNER_DELETED=true
+        fi
+    done <<< "$journal"
+    return 0
+}
+
+# Resolve a job's registration from the optional runner-name file, else the unit journal.
+# KVD_RUNNER_NAME stays empty when no registration under the adapter prefix is known.
+kvd_job_runner_identity() {
+    local adapter=$1 job_id=$2 unit=$3 prefix=${KVD_A_PREFIX[$1]} name name_file
+    KVD_RUNNER_NAME=''
+    KVD_RUNNER_DELETED=false
+    kvd_unit_journal_runner "$unit" || return 1
+    name=$KVD_JOURNAL_RUNNER_NAME
+    name_file="$KVD_STATE_DIR/jobs/$job_id/runner-name"
+    [[ -r $name_file ]] && name=$(<"$name_file")
+    [[ $name =~ ^[A-Za-z0-9_.-]+$ && $name == "$prefix"* ]] || return 0
+    KVD_RUNNER_NAME=$name
+    [[ $name == "$KVD_JOURNAL_RUNNER_NAME" ]] && KVD_RUNNER_DELETED=$KVD_JOURNAL_RUNNER_DELETED
+    return 0
+}
+
 kvd_runner_busy() {
-    local adapter=$1 job_id=$2 installation=${KVD_A_INSTALLATION[$1]} repo=${KVD_A_REPO[$1]}
-    local prefix=${KVD_A_PREFIX[$1]} runners expected
-    expected="$prefix$job_id"
+    local adapter=$1 job_id=$2 unit=$3 installation=${KVD_A_INSTALLATION[$1]} repo=${KVD_A_REPO[$1]}
+    KVD_RUNNER_BUSY=false
+    if ! kvd_job_runner_identity "$adapter" "$job_id" "$unit"; then
+        KVD_RUNNER_BUSY=unknown
+        return 1
+    fi
+    [[ -n $KVD_RUNNER_NAME ]] || return 0
     if ! kvd_list_runners "$installation" "$repo"; then
         KVD_RUNNER_BUSY=unknown
         return 1
     fi
-    runners=$KVD_RUNNERS
-    if jq -e --arg name "$expected" '.runners[]? | select(.name == $name and .busy == true)' <<< "$runners" >/dev/null; then
+    if jq -e --arg name "$KVD_RUNNER_NAME" '.runners[]? | select(.name == $name and .busy == true)' <<< "$KVD_RUNNERS" >/dev/null; then
         KVD_RUNNER_BUSY=true
-    else
-        KVD_RUNNER_BUSY=false
     fi
 }
 
 kvd_sweep_job() {
-    local job_id=$1 state_file adapter repo unit installation prefix runners runner_id runner_name busy
+    local job_id=$1 state_file adapter repo unit installation runner_id busy
     state_file="$KVD_STATE_DIR/jobs/$job_id/state.json"
     [[ -r $state_file ]] || return 0
     adapter=$(jq -r '.adapter' "$state_file")
@@ -621,23 +656,25 @@ kvd_sweep_job() {
     unit=$(jq -r '.unit' "$state_file")
     kvd_systemd_active "$unit" && return 1
     installation=${KVD_A_INSTALLATION[$adapter]}
-    prefix=${KVD_A_PREFIX[$adapter]}
+    kvd_job_runner_identity "$adapter" "$job_id" "$unit" || return 1
 
-    # Force a newly minted installation token for terminal cleanup, even if a cached
-    # token still has time remaining.
-    if ! kvd_list_runners "$installation" "$repo" 1; then
-        return 1
-    fi
-    runners=$KVD_RUNNERS
-    while IFS=$'\t' read -r runner_id runner_name busy; do
-        [[ $runner_id =~ ^[0-9]+$ && $runner_name == "$prefix$job_id" ]] || continue
-        [[ $busy == true ]] && return 1
-        if kvd_github_request "$installation" DELETE "/repos/$repo/actions/runners/$runner_id"; then
-            kvd_log "orphan-runner-deleted repo=$repo runner=$runner_name"
-        else
+    # The job script's own DELETE is authoritative when its journal records success.
+    # Otherwise force a newly minted installation token for terminal cleanup, even if
+    # a cached token still has time remaining.
+    if [[ -n $KVD_RUNNER_NAME && $KVD_RUNNER_DELETED == false ]]; then
+        if ! kvd_list_runners "$installation" "$repo" 1; then
             return 1
         fi
-    done < <(jq -r '.runners[]? | [.id,.name,(.busy|tostring)] | @tsv' <<< "$runners")
+        while IFS=$'\t' read -r runner_id busy; do
+            [[ $runner_id =~ ^[0-9]+$ ]] || continue
+            [[ $busy == true ]] && return 1
+            if kvd_github_request "$installation" DELETE "/repos/$repo/actions/runners/$runner_id"; then
+                kvd_log "orphan-runner-deleted repo=$repo runner=$KVD_RUNNER_NAME"
+            else
+                return 1
+            fi
+        done < <(jq -r --arg name "$KVD_RUNNER_NAME" '.runners[]? | select(.name == $name) | [.id,(.busy|tostring)] | @tsv' <<< "$KVD_RUNNERS")
+    fi
 
     kvd_set_job_phase "$job_id" SWEPT
     rm -rf -- "$KVD_STATE_DIR/jobs/$job_id"
@@ -812,7 +849,6 @@ kvd_start_candidate() {
 
 kvd_schedule_queued() {
     local item
-    [[ $KVD_POLLS_OK == 1 ]] || return 0
     while IFS= read -r item; do
         [[ -n $item ]] || continue
         if kvd_candidate_allowed "$item"; then
@@ -870,7 +906,7 @@ kvd_monitor_inflight() {
         [[ ${KVD_REPO_OK[$adapter]:-0} == 1 ]] || continue
         status=$(jq -r --arg id "$job_id" '.[$id].status // "gone"' <<< "$KVD_JOB_MAP")
         if [[ $status != queued && $status != in_progress ]]; then
-            if kvd_runner_busy "$adapter" "$job_id"; then
+            if kvd_runner_busy "$adapter" "$job_id" "$unit"; then
                 busy=$KVD_RUNNER_BUSY
                 if [[ $busy == false ]] && systemctl stop "$unit"; then
                     kvd_mark_job_consumed "$job_id"
@@ -883,13 +919,21 @@ kvd_monitor_inflight() {
     done
 }
 
-kvd_adopt_active_units() {
-    local listing unit adapter prefix job_id state_dir state_file started_text started_epoch repo now since_text phase
+kvd_active_job_units() {
+    local listing unit
     listing=$(systemctl list-units --state=active --type=service --no-legend --plain --full '*-runner-job@*.service' 2>/dev/null || true)
-    now=$(kvd_now)
     while IFS= read -r unit; do
         unit=${unit%%[[:space:]]*}
-        [[ $unit == *-runner-job@*.service ]] || continue
+        [[ $unit == *-runner-job@*.service ]] && printf '%s\n' "$unit"
+    done <<< "$listing"
+    return 0
+}
+
+kvd_adopt_active_units() {
+    local unit adapter prefix job_id state_dir state_file started_text started_epoch repo now since_text phase
+    now=$(kvd_now)
+    while IFS= read -r unit; do
+        [[ -n $unit ]] || continue
         for adapter in "${KVD_ADAPTER_NAMES[@]}"; do
             prefix=${KVD_A_UNIT[$adapter]}
             [[ $unit == "$prefix"*'.service' ]] || continue
@@ -926,30 +970,53 @@ kvd_adopt_active_units() {
             fi
             break
         done
-    done <<< "$listing"
+    done < <(kvd_active_job_units)
 }
 
+# Delete offline, idle registrations under an adapter prefix that no active job unit
+# references. Runners are listed before journals are read, so a registration minted
+# after the listing cannot be mistaken for an orphan.
 kvd_sweep_orphan_runners() {
-    local adapter repo installation prefix runners runner_id runner_name status active_unit suffix
+    local adapter repo installation prefix unit job_id name_file runner_id runner_name referenced='[]'
+    local -a names=()
+    local -A runners=()
     for adapter in "${KVD_ADAPTER_NAMES[@]}"; do
+        if kvd_list_runners "${KVD_A_INSTALLATION[$adapter]}" "${KVD_A_REPO[$adapter]}" 1; then
+            runners[$adapter]=$KVD_RUNNERS
+        fi
+    done
+    while IFS= read -r unit; do
+        [[ -n $unit ]] || continue
+        if ! kvd_unit_journal_runner "$unit"; then
+            kvd_log "orphan-sweep-skipped unit=$unit reason=journal-unavailable"
+            return 0
+        fi
+        job_id=${unit#*-runner-job@}
+        job_id=${job_id%.service}
+        name_file="$KVD_STATE_DIR/jobs/$job_id/runner-name"
+        names=()
+        [[ -n $KVD_JOURNAL_RUNNER_NAME ]] && names+=("$KVD_JOURNAL_RUNNER_NAME")
+        [[ $job_id =~ ^[0-9a-z-]+$ && -r $name_file ]] && names+=("$(<"$name_file")")
+        if (( ${#names[@]} == 0 )); then
+            kvd_log "orphan-sweep-skipped unit=$unit reason=runner-unidentified"
+            return 0
+        fi
+        referenced=$(jq -c '. + $ARGS.positional' --args "${names[@]}" <<< "$referenced")
+    done < <(kvd_active_job_units)
+
+    for adapter in "${!runners[@]}"; do
         repo=${KVD_A_REPO[$adapter]}
         installation=${KVD_A_INSTALLATION[$adapter]}
         prefix=${KVD_A_PREFIX[$adapter]}
-        if ! kvd_list_runners "$installation" "$repo" 1; then
-            continue
-        fi
-        runners=$KVD_RUNNERS
-        while IFS=$'\t' read -r runner_id runner_name status; do
-            [[ $runner_id =~ ^[0-9]+$ && $runner_name == "$prefix"* ]] || continue
-            suffix=${runner_name#"$prefix"}
-            [[ $suffix =~ ^[0-9a-z-]+$ ]] || continue
-            [[ $status == offline ]] || continue
-            active_unit="${KVD_A_UNIT[$adapter]}$suffix.service"
-            kvd_systemd_active "$active_unit" && continue
+        while IFS=$'\t' read -r runner_id runner_name; do
+            [[ $runner_id =~ ^[0-9]+$ ]] || continue
             if kvd_github_request "$installation" DELETE "/repos/$repo/actions/runners/$runner_id"; then
                 kvd_log "orphan-runner-deleted repo=$repo runner=$runner_name"
             fi
-        done < <(jq -r '.runners[]? | [.id,.name,.status] | @tsv' <<< "$runners")
+        done < <(jq -r --arg prefix "$prefix" --argjson referenced "$referenced" '
+          .runners[]?
+          | select((.name | startswith($prefix)) and .status == "offline" and .busy == false and (.name | IN($referenced[]) | not))
+          | [.id,.name] | @tsv' <<< "${runners[$adapter]}")
     done
 }
 

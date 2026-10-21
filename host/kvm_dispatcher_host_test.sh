@@ -18,10 +18,11 @@ assert_contains() {
     [[ $haystack == *"$needle"* ]] || fail "expected output to contain: $needle"
 }
 
-mkdir -p "$TMP_DIR/bin" "$TMP_DIR/config/repos.d" "$TMP_DIR/state" "$TMP_DIR/status" "$TMP_DIR/github" "$TMP_DIR/creds"
+mkdir -p "$TMP_DIR/bin" "$TMP_DIR/config/repos.d" "$TMP_DIR/state" "$TMP_DIR/status" "$TMP_DIR/github" "$TMP_DIR/journal" "$TMP_DIR/creds"
 export PATH="$TMP_DIR/bin:$PATH"
 export KVD_API_URL=https://api.github.test
 export FAKE_GITHUB_DIR="$TMP_DIR/github"
+export FAKE_JOURNAL_DIR="$TMP_DIR/journal"
 export FAKE_ARGV_LOG="$TMP_DIR/argv.log"
 export FAKE_SYSTEMCTL_ACTIVE="$TMP_DIR/active-units"
 export FAKE_START_FAILURES="$TMP_DIR/start-failures"
@@ -169,7 +170,21 @@ case $command in
         ;;
 esac
 FAKE_SYSTEMCTL
-chmod +x "$TMP_DIR/bin/curl" "$TMP_DIR/bin/openssl" "$TMP_DIR/bin/systemctl"
+cat > "$TMP_DIR/bin/journalctl" <<'FAKE_JOURNALCTL'
+#!/usr/bin/env bash
+set -o errexit -o nounset -o pipefail
+unit=
+for arg in "$@"; do
+    case $arg in
+        --unit=*) unit=${arg#--unit=} ;;
+    esac
+done
+[[ -n $unit ]] || { printf 'fake journalctl requires --unit\n' >&2; exit 2; }
+fixture="$FAKE_JOURNAL_DIR/$unit.log"
+[[ -r $fixture ]] && cat "$fixture"
+exit 0
+FAKE_JOURNALCTL
+chmod +x "$TMP_DIR/bin/curl" "$TMP_DIR/bin/openssl" "$TMP_DIR/bin/systemctl" "$TMP_DIR/bin/journalctl"
 
 BASE_NOW=$(date -u -d '2026-01-01T00:00:00Z' +%s)
 export FAKE_TOKEN_EXPIRY=2026-01-01T01:00:00Z
@@ -198,7 +213,7 @@ write_config() {
 }
 
 clear_fixtures() {
-    rm -f "$FAKE_GITHUB_DIR"/*
+    rm -f "$FAKE_GITHUB_DIR"/* "$FAKE_JOURNAL_DIR"/*
     : > "$FAKE_SYSTEMCTL_ACTIVE"
     : > "$FAKE_START_LOG"
     : > "$FAKE_STOP_LOG"
@@ -223,6 +238,16 @@ set_runs() {
 set_jobs() {
     local repo_key=$1 run_id=$2 jobs_json=$3
     printf '{"jobs":%s}\n' "$jobs_json" > "$FAKE_GITHUB_DIR/$repo_key.jobs.$run_id.json"
+}
+# Journal lines in the format the QA2 and Qoral job scripts write to their unit.
+journal_minted() {
+    local unit=$1 runner_id=$2 runner_name=$3
+    printf '2026-01-01T00:00:01Z qa2-runner: job=%s event=jitconfig-minted runner_id=%s runner_name=%s\n' \
+        "${runner_name#*-kvm-}" "$runner_id" "$runner_name" >> "$FAKE_JOURNAL_DIR/$unit.log"
+}
+journal_deleted() {
+    local unit=$1 runner_id=$2
+    printf '2026-01-01T00:01:00Z qa2-runner: job=x event=runner-deleted runner_id=%s http=204\n' "$runner_id" >> "$FAKE_JOURNAL_DIR/$unit.log"
 }
 run_dispatcher() {
     "$ROOT_DIR/host/kvm_dispatcher.sh" > "$TMP_DIR/output.log" 2>&1 || {
@@ -301,16 +326,52 @@ run_dispatcher
 [[ $(wc -l < "$FAKE_START_LOG") -eq 3 ]] || fail 'dispatcher did not retry exactly three times'
 jq -e '.blocked | any(.[]; .job_id == "1005" and .attempts == 3)' "$TMP_DIR/status/status.json" >/dev/null || fail 'three-strike blocked list is missing the job'
 
-# A vanished, non-busy job stops its unit and sweeps its runner registration.
+# A failing installation does not hold back scheduling for another repository.
+clear_fixtures
+export FAKE_HTTP_FAIL_MATCH='/repos/qorraq/qoral/actions/runs'
+set_runs qniapp_qa2 queued '[{"id":106}]'
+set_jobs qniapp_qa2 106 '[{"id":1014,"status":"queued","created_at":"2026-01-01T00:00:10Z","labels":["qa2-kvm"]}]'
+run_dispatcher
+unset FAKE_HTTP_FAIL_MATCH
+assert_contains "$(<"$FAKE_START_LOG")" 'qa2-runner-job@1014.service'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=poll-error http=500 repo=qorraq/qoral'
+
+# A vanished, non-busy job stops its unit and deletes the registration named in its journal,
+# because the script did not log its own successful DELETE.
 clear_fixtures
 add_job_state qa2 qniapp/qa2 1006 qa2-runner-job@1006.service "$BASE_NOW" 5400
-printf '{"runners":[{"id":77,"name":"qa2-kvm-1006","status":"online","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+journal_minted qa2-runner-job@1006.service 77 qa2-kvm-20260101T000001Z-4242
+printf '{"runners":[{"id":77,"name":"qa2-kvm-20260101T000001Z-4242","status":"online","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
 run_dispatcher
 assert_contains "$(<"$FAKE_STOP_LOG")" 'qa2-runner-job@1006.service'
-if ! grep -Fq 'DELETE' "$FAKE_ARGV_LOG"; then
-    printf 'cancel dispatcher output:\n%s\nargv:\n%s\n' "$(<"$TMP_DIR/output.log")" "$(<"$FAKE_ARGV_LOG")" >&2
-    fail 'cancel cleanup did not delete the runner registration'
-fi
+assert_contains "$(<"$FAKE_ARGV_LOG")" '--request DELETE'
+assert_contains "$(<"$FAKE_ARGV_LOG")" '/repos/qniapp/qa2/actions/runners/77'
+[[ ! -e $TMP_DIR/state/jobs/1006 ]] || fail 'cancelled job state was not swept'
+
+# Per-job SWEPT leaves the registration alone when the script logged its own DELETE.
+clear_fixtures
+add_job_state qa2 qniapp/qa2 1015 qa2-runner-job@1015.service "$((BASE_NOW - 60))" 5400
+: > "$FAKE_SYSTEMCTL_ACTIVE"
+journal_minted qa2-runner-job@1015.service 78 qa2-kvm-20260101T000002Z-4243
+journal_deleted qa2-runner-job@1015.service 78
+printf '{"runners":[{"id":78,"name":"qa2-kvm-20260101T000002Z-4243","status":"offline","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+source "$ROOT_DIR/host/kvm_dispatcher_lib.sh"
+kvd_load_config
+kvd_handle_inactive_job 1015 > "$TMP_DIR/output.log"
+! grep -Fq -- '--request DELETE' "$FAKE_ARGV_LOG" || fail 'SWEPT deleted a registration the job script had already deleted'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-swept repo=qniapp/qa2 job=1015'
+
+# The optional runner-name file identifies the registration when the journal has none.
+clear_fixtures
+add_job_state qoral qorraq/qoral 1016 qoral-runner-job@1016.service "$((BASE_NOW - 60))" 19800
+: > "$FAKE_SYSTEMCTL_ACTIVE"
+printf 'qoral-kvm-exact-1016' > "$TMP_DIR/state/jobs/1016/runner-name"
+printf '{"runners":[{"id":79,"name":"qoral-kvm-exact-1016","status":"offline","busy":false},{"id":80,"name":"qoral-kvm-other","status":"offline","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qorraq_qoral.runners.json"
+source "$ROOT_DIR/host/kvm_dispatcher_lib.sh"
+kvd_load_config
+kvd_handle_inactive_job 1016 > "$TMP_DIR/output.log"
+assert_contains "$(<"$FAKE_ARGV_LOG")" '/repos/qorraq/qoral/actions/runners/79'
+[[ $(grep -c -- '--request DELETE' "$FAKE_ARGV_LOG") -eq 1 ]] || fail 'per-job SWEPT deleted a registration other than its own'
 
 # Finished units report cgroup memory peaks and are not relaunched for a still-queued job ID.
 clear_fixtures
@@ -332,17 +393,39 @@ assert_contains "$(<"$FAKE_STOP_LOG")" 'qa2-runner-job@1007.service'
 # Startup resync adopts an active configured unit whose state file was lost.
 clear_fixtures
 printf '%s\n' 'qoral-runner-job@1011.service' > "$FAKE_SYSTEMCTL_ACTIVE"
-printf '{"runners":[{"id":66,"name":"qoral-kvm-1011","status":"online","busy":true}]}\n' > "$FAKE_GITHUB_DIR/qorraq_qoral.runners.json"
+journal_minted qoral-runner-job@1011.service 66 qoral-kvm-20260101T000000Z-77
+printf '{"runners":[{"id":66,"name":"qoral-kvm-20260101T000000Z-77","status":"online","busy":true}]}\n' > "$FAKE_GITHUB_DIR/qorraq_qoral.runners.json"
 run_dispatcher
 jq -e '.in_flight | any(.[]; .job_id == "1011" and .unit == "qoral-runner-job@1011.service")' "$TMP_DIR/status/status.json" >/dev/null || fail 'startup resync did not adopt the active unit'
 [[ $(jq -r '.phase' "$TMP_DIR/state/jobs/1011/state.json") == RUNNING ]] || fail 'adopted unit has the wrong phase'
 
-# Startup resync removes offline registrations with no active unit.
+# Startup resync removes only offline, idle, prefix-matching registrations that no
+# active job unit journal references.
 clear_fixtures
-printf '{"runners":[{"id":88,"name":"qa2-kvm-1008","status":"offline","busy":false},{"id":89,"name":"unrelated-1008","status":"offline","busy":false}]}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+set_runs qniapp_qa2 in_progress '[{"id":107}]'
+set_jobs qniapp_qa2 107 '[{"id":1013,"status":"in_progress","created_at":"2026-01-01T00:00:01Z","labels":["qa2-kvm"]}]'
+printf '%s\n' 'qa2-runner-job@1013.service' > "$FAKE_SYSTEMCTL_ACTIVE"
+journal_minted qa2-runner-job@1013.service 90 qa2-kvm-20260101T000000Z-7
+orphan_runners='{"runners":[
+  {"id":88,"name":"qa2-kvm-20251231T230000Z-1","status":"offline","busy":false},
+  {"id":89,"name":"unrelated-1008","status":"offline","busy":false},
+  {"id":90,"name":"qa2-kvm-20260101T000000Z-7","status":"offline","busy":false},
+  {"id":91,"name":"qa2-kvm-20251231T230000Z-2","status":"online","busy":false},
+  {"id":92,"name":"qa2-kvm-20251231T230000Z-3","status":"offline","busy":true}]}'
+printf '%s\n' "$orphan_runners" > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
 run_dispatcher
 assert_contains "$(<"$FAKE_ARGV_LOG")" '/repos/qniapp/qa2/actions/runners/88'
-[[ $(grep -c 'DELETE' "$FAKE_ARGV_LOG") -eq 1 ]] || fail 'resync deleted a non-matching runner or missed its orphan'
+[[ $(grep -c -- '--request DELETE' "$FAKE_ARGV_LOG") -eq 1 ]] || fail 'resync deleted a referenced, live, or non-matching runner or missed its orphan'
+
+# An active unit whose registration cannot be identified yet suspends orphan cleanup.
+clear_fixtures
+set_runs qniapp_qa2 in_progress '[{"id":107}]'
+set_jobs qniapp_qa2 107 '[{"id":1013,"status":"in_progress","created_at":"2026-01-01T00:00:01Z","labels":["qa2-kvm"]}]'
+printf '%s\n' 'qa2-runner-job@1013.service' > "$FAKE_SYSTEMCTL_ACTIVE"
+printf '%s\n' "$orphan_runners" > "$FAKE_GITHUB_DIR/qniapp_qa2.runners.json"
+run_dispatcher
+! grep -Fq -- '--request DELETE' "$FAKE_ARGV_LOG" || fail 'orphan cleanup ran while an active unit had an unidentified registration'
+assert_contains "$(<"$TMP_DIR/output.log")" 'event=orphan-sweep-skipped unit=qa2-runner-job@1013.service reason=runner-unidentified'
 
 # Installation tokens are reused at exactly 10 minutes remaining and refreshed below it.
 clear_fixtures
@@ -394,10 +477,10 @@ rule_line=$(grep -F 'var allowedUnit =' "$rule_file")
 pattern=${rule_line#*= /}
 pattern=${pattern%;*}
 pattern=${pattern%/}
-for unit in qa2-runner-job@123.service qoral-runner-job@a-1.service qa2-agent-loop-runner-job@0.service; do
+for unit in qa2-runner-job@123.service qoral-runner-job@a-1.service; do
     [[ $unit =~ $pattern ]] || fail "polkit regex rejected $unit"
 done
-for unit in qa2-runner@123.service qoral-runner-job@ABC.service qa2-runner-job@123.service.service; do
+for unit in qa2-runner@123.service qoral-runner-job@ABC.service qa2-runner-job@123.service.service qa2-agent-loop-runner-job@0.service; do
     [[ ! $unit =~ $pattern ]] || fail "polkit regex accepted $unit"
 done
 
@@ -410,6 +493,41 @@ cp "$ROOT_DIR/host/kvm_dispatcher.sh" "$ROOT_DIR/host/kvm_dispatcher_lib.sh" "$V
 chmod +x "$VERIFY_ROOT/opt/kvm-dispatcher/host/kvm_dispatcher.sh"
 systemd-analyze verify --root="$VERIFY_ROOT" kvm-dispatcher.service
 
-bash -n "$ROOT_DIR/host/kvm_dispatcher.sh" "$ROOT_DIR/host/kvm_dispatcher_lib.sh" "$ROOT_DIR/host/kvm_dispatcher_sweep.sh" "$ROOT_DIR/host/kvm_dispatcher_host_wizard.sh"
-shellcheck -x "$ROOT_DIR/host/kvm_dispatcher.sh" "$ROOT_DIR/host/kvm_dispatcher_lib.sh" "$ROOT_DIR/host/kvm_dispatcher_sweep.sh" "$ROOT_DIR/host/kvm_dispatcher_host_wizard.sh" "$ROOT_DIR/host/kvm_dispatcher_host_test.sh"
+# Each job template keeps the repository's isolation drop-in, whose shared
+# RuntimeDirectory the shipped 20-job-runtime.conf must replace, not extend.
+effective_service_values() {
+    local key=$1 unit_file=$2 dropin_dir=$3 instance=$4 file line value
+    local -a values=()
+    for file in "$unit_file" "$dropin_dir"/*.conf; do
+        while IFS= read -r line; do
+            [[ $line == "$key="* ]] || continue
+            value=${line#"$key="}
+            if [[ -z $value ]]; then
+                values=()
+            else
+                read -r -a parts <<< "$value"
+                values+=("${parts[@]}")
+            fi
+        done < "$file"
+    done
+    printf '%s\n' "${values[@]//%i/$instance}"
+}
+for template in qa2 qoral; do
+    unit_dir="$VERIFY_ROOT/etc/systemd/system"
+    dropin_dir="$unit_dir/$template-runner-job@.service.d"
+    mkdir -p "$dropin_dir"
+    printf '#!/bin/sh\n' > "$VERIFY_ROOT/opt/$template-job.sh"
+    chmod +x "$VERIFY_ROOT/opt/$template-job.sh"
+    printf '[Service]\nType=exec\nRestart=no\nExecStart=/opt/%s-job.sh\n' "$template" > "$unit_dir/$template-runner-job@.service"
+    printf '[Service]\nRuntimeDirectory=%s-runner\nRuntimeDirectoryMode=0700\n' "$template" > "$dropin_dir/10-isolation.conf"
+    cp "$ROOT_DIR/host/systemd/examples/$template-runner-job@.service.d/20-job-runtime.conf" "$dropin_dir/20-job-runtime.conf"
+    systemd-analyze verify --root="$VERIFY_ROOT" "$template-runner-job@1001.service"
+    [[ $(effective_service_values RuntimeDirectory "$unit_dir/$template-runner-job@.service" "$dropin_dir" 1001) == "$template-runner-job-1001" ]] ||
+        fail "$template job template does not get exactly one per-job RuntimeDirectory"
+    [[ $(effective_service_values RuntimeDirectoryMode "$unit_dir/$template-runner-job@.service" "$dropin_dir" 1001 | tail -n 1) == 0700 ]] ||
+        fail "$template job RuntimeDirectoryMode is not 0700"
+done
+
+bash -n "$ROOT_DIR/host/kvm_dispatcher.sh" "$ROOT_DIR/host/kvm_dispatcher_lib.sh" "$ROOT_DIR/host/kvm_dispatcher_host_wizard.sh"
+shellcheck -x "$ROOT_DIR/host/kvm_dispatcher.sh" "$ROOT_DIR/host/kvm_dispatcher_lib.sh" "$ROOT_DIR/host/kvm_dispatcher_host_wizard.sh" "$ROOT_DIR/host/kvm_dispatcher_host_test.sh"
 printf 'PASS: dispatcher host tests\n'
