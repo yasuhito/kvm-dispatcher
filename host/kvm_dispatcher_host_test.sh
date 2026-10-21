@@ -563,6 +563,24 @@ run_dispatcher
 jq -e '.recent | length == 20 and ([.[].job_id] == ([range(3021; 3001; -1)] | map(tostring)))' "$TMP_DIR/status/status.json" >/dev/null || fail 'recent history is not the newest 20 jobs, newest first, after a restart'
 jq -e '.recent[0] == {"repo":"qniapp/qa2","job_id":"3021","unit":"qa2-runner-job@3021.service","outcome":"stuck","started_at":"2026-01-01T00:00:00Z","finished_at":"2026-01-01T00:00:21Z","duration_s":21,"memory_peak_mib":null,"exit_status":null}' "$TMP_DIR/status/status.json" >/dev/null || fail 'recent entry with an unknown exit status and memory peak is not null'
 
+# An empty, truncated, or wrong-shaped recent history neither stops dispatch nor blocks a
+# finished job's transition; it reads as empty and the next finished job rewrites it.
+for corrupt in '' '[{"repo":"qniapp/qa2"' '{"recent":[]}' '[1]'; do
+    clear_fixtures
+    printf '%s' "$corrupt" > "$TMP_DIR/status/recent.json"
+    add_job_state qa2 qniapp/qa2 1030 qa2-runner-job@1030.service "$((BASE_NOW - 30))" 5400
+    : > "$FAKE_SYSTEMCTL_ACTIVE"
+    printf '{"id":1030,"status":"completed","runner_name":null}\n' > "$FAKE_GITHUB_DIR/qniapp_qa2.job.1030.json"
+    set_runs qniapp_qa2 queued '[{"id":109}]'
+    set_jobs qniapp_qa2 109 '[{"id":1031,"status":"queued","created_at":"2026-01-01T00:00:01Z","labels":["qa2-kvm"]}]'
+    run_dispatcher
+    assert_contains "$(<"$TMP_DIR/output.log")" "event=recent-history-invalid file=$TMP_DIR/status/recent.json"
+    assert_contains "$(<"$TMP_DIR/output.log")" 'event=job-swept repo=qniapp/qa2 job=1030'
+    assert_contains "$(<"$FAKE_START_LOG")" 'qa2-runner-job@1031.service'
+    jq -e '[.recent[].job_id] == ["1030"]' "$TMP_DIR/status/status.json" >/dev/null || fail "corrupt recent history ${corrupt@Q} was not replaced by the finished job"
+    jq -e '[.[].job_id] == ["1030"]' "$TMP_DIR/status/recent.json" >/dev/null || fail "corrupt recent history ${corrupt@Q} was not rewritten"
+done
+
 # The runner started for job X took the newer job Y. X was not run, so it is not consumed:
 # it counts as a start failure, returns after 300 seconds, and a worker that never runs
 # it is blocked on the third strike instead of relaunching guests without limit.

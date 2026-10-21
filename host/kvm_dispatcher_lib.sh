@@ -747,13 +747,13 @@ kvd_record_job_finished() {
 }
 
 # The newest 20 finished jobs, newest first. Kept beside status.json so the history
-# survives dispatcher restarts and host reboots.
+# survives dispatcher restarts and host reboots. History that is not an array of objects
+# is reported and read as empty; the next finished job rewrites the file.
 kvd_recent_jobs() {
-    if [[ -r $KVD_RECENT_FILE ]]; then
-        cat -- "$KVD_RECENT_FILE"
-    else
-        printf '[]\n'
-    fi
+    [[ -e $KVD_RECENT_FILE ]] || { printf '[]\n'; return 0; }
+    jq -ce 'if type == "array" and all(.[]; type == "object") then . else error end' "$KVD_RECENT_FILE" 2>/dev/null && return 0
+    kvd_log "recent-history-invalid file=$KVD_RECENT_FILE" >&2
+    printf '[]\n'
 }
 
 kvd_handle_inactive_job() {
