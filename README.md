@@ -2,7 +2,7 @@
 
 A small GitHub Actions dispatcher for repositories that share one KVM host. The dispatcher starts an existing repository-specific worker unit only after finding a matching queued job. Runner scripts remain responsible for their JIT configuration, guest boot, job execution, and guest cleanup. This removes idle guests from the host without merging repository-specific VM code into the dispatcher.
 
-The initial Beelink policy is one 12 GiB guest at a time. It records the guest cgroup's `memory.peak` after each unit exits so capacity can be reconsidered from measurements, not guesses.
+The initial Beelink policy is one 12 GiB guest at a time. It samples each job unit's cgroup `memory.peak` while the unit is active, because systemd discards it once the unit exits, and records the maximum as `memory_peak_mib` so capacity can be reconsidered from measurements, not guesses.
 
 ## Host components
 
