@@ -673,6 +673,37 @@ verify_dispatcher_service() {
         "$(systemctl_state is-enabled kvm-dispatcher.service)"
 }
 
+verify_stopped_after_stop() {
+    local unit=$1 active output result exec_status
+    active=$(systemctl_state is-active "$unit")
+    case $active in
+        inactive)
+            printf '%s: is-active=inactive\n' "$unit"
+            ;;
+        failed)
+            output=$(systemctl_cmd show --property=Result --property=ExecMainStatus "$unit" 2>/dev/null) || {
+                fail "$unit の停止結果をsystemdから読み取れません。"
+                return 1
+            }
+            result=$(awk -F= '$1 == "Result" { print substr($0, index($0, "=") + 1); exit }' <<< "$output")
+            exec_status=$(awk -F= '$1 == "ExecMainStatus" { print substr($0, index($0, "=") + 1); exit }' <<< "$output")
+            if [[ -z $result || -z $exec_status ]]; then
+                fail "$unit の停止結果にResultまたはExecMainStatusがありません。"
+                return 1
+            fi
+            printf '%s の停止後にsystemdがfailedを報告しました。is-active=failedで、activeではありません。Result=%s、ExecMainStatus=%s\n' \
+                "$unit" "$result" "$exec_status"
+            run_systemctl_action "$unit のfailed状態を消去するため、systemctl reset-failed $unitを実行します。" \
+                stopped-failed-cleared reset-failed "$unit" || return 1
+            require_service_state is-active "$unit" inactive
+            ;;
+        *)
+            fail "$unit の状態が想定と異なります。停止後はis-active=inactiveまたはfailedが必要ですが、$activeでした。"
+            return 1
+            ;;
+    esac
+}
+
 verify_legacy_disabled() {
     require_service_state is-active "$LEGACY_UNIT" inactive || return 1
     require_service_state is-enabled "$LEGACY_UNIT" disabled
@@ -686,6 +717,7 @@ stop_qa2_legacy() {
         fail 'qa2-runner.serviceを停止できませんでした。'
         return 1
     fi
+    verify_stopped_after_stop qa2-runner.service
 }
 
 wait_for_fresh_poll() {
@@ -890,7 +922,6 @@ qa2_stage() {
         offer_rollback qa2
         return 1
     }
-    require_service_state is-active qa2-runner.service inactive || { offer_rollback qa2; return 1; }
     run_systemctl_action 'qa2-runner.serviceをdisableします。unit fileは削除しません。' legacy-disabled disable qa2-runner.service || {
         offer_rollback qa2
         return 1
@@ -1049,7 +1080,7 @@ rollback_action() {
     active=$(systemctl_state is-active kvm-dispatcher.service)
     if [[ $active == active ]]; then
         run_systemctl_action 'kvm-dispatcher.serviceをstopします。' rollback-dispatcher-stopped stop kvm-dispatcher.service || return 1
-        require_service_state is-active kvm-dispatcher.service inactive || return 1
+        verify_stopped_after_stop kvm-dispatcher.service || return 1
     fi
     enabled=$(systemctl_state is-enabled kvm-dispatcher.service)
     if (( keep_dispatcher == 0 )) && [[ $enabled == enabled ]]; then
@@ -1068,7 +1099,7 @@ rollback_action() {
                 return 1
             }
             run_systemctl_action "$unitをstopします。" rollback-job-stopped stop "$unit" || return 1
-            require_service_state is-active "$unit" inactive || return 1
+            verify_stopped_after_stop "$unit" || return 1
         done <<< "$units"
     fi
     adapter_path=$(path_at_root "/etc/kvm-dispatcher/repos.d/$ADAPTER.conf")
