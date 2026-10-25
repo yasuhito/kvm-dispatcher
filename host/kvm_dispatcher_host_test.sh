@@ -867,6 +867,7 @@ grep -Fq 'It will not be overwritten' "$TMP_DIR/install-wizard.out" || fail 'ins
 while IFS= read -r -d '' script; do
     bash -n "$ROOT_DIR/$script"
 done < <(git -C "$ROOT_DIR" ls-files -z '*.sh')
-bash -n "$WIZARD_INSTALLER"
+bash -n "$WIZARD_INSTALLER" "$ROOT_DIR/host/kvm_dispatcher_cutover_wizard.sh" "$ROOT_DIR/host/kvm_dispatcher_cutover_wizard_test.sh"
 (cd "$ROOT_DIR" && shellcheck -x host/*.sh)
+bash "$ROOT_DIR/host/kvm_dispatcher_cutover_wizard_test.sh"
 printf 'PASS: dispatcher host tests\n'
