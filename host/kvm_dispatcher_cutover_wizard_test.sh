@@ -54,7 +54,7 @@ case $command_name in
             exit 1
         else
             case ${1:-} in
-                kvm-dispatcher.service|qa2-runner.service|qoral-runner.service) printf '%s\n' "$fallback" ;;
+                kvm-dispatcher.service|qa2-runner.service|qoral-runner.service|qa2-runner-job@*.service|qoral-runner-job@*.service) printf '%s\n' "$fallback" ;;
                 *) printf '%s\n' not-found; exit 1 ;;
             esac
             exit 1
@@ -315,13 +315,20 @@ run_sourced_wizard() {
         confirm_legacy_ready() { return 0; }
         # shellcheck disable=SC2329
         place_file() {
-            local source=$1 destination=$2 mode=$3
+            local source=$1 destination=$2 mode=$3 owner_group=$4 description=$5
+            if [[ -e $destination || -L $destination ]]; then
+                cmp -s -- "$source" "$destination" || return 1
+                printf '同じfileがあるため配置を省略します: %s\n' "$destination"
+                return 0
+            fi
+            confirm_action "$source を $destination に配置します。owner:group=$owner_group、mode=$mode" || return 1
             install -D --mode="$mode" -- "$source" "$destination"
         }
         # shellcheck disable=SC2329
         systemctl_cmd() { command systemctl "$@"; }
         case $action in
             template) load_target "$target"; verify_template_properties ;;
+            preconditions) load_target "$target"; check_stage_preconditions ;;
             stage) qa2_stage ;;
             rollback) load_target "$target"; rollback_stage ;;
             *) exit 2 ;;
@@ -427,6 +434,19 @@ else
     [[ ! -s $FAKE_MUTATION_LOG ]] || record_regression_failure 'pre-stop failed QA2 refusal changed systemd state'
 fi
 
+printf '%s\n' qoral-runner.service > "$FAKE_FAILED_UNITS"
+printf '%s\n' kvm-dispatcher.service > "$FAKE_ACTIVE_UNITS"
+printf '%s\n' kvm-dispatcher.service > "$FAKE_ENABLED_UNITS"
+: > "$FAKE_MUTATION_LOG"
+if output=$(run_sourced_wizard preconditions qoral 2>&1); then
+    record_regression_failure 'Qoral stage accepted a legacy service that was already failed before stop'
+else
+    assert_contains "$output" 'Qoral legacy unitは変更しません'
+    grep -Fxq qoral-runner.service "$FAKE_FAILED_UNITS" || record_regression_failure 'pre-stage failed Qoral unit was cleared'
+    grep -Fq 'reset-failed qoral-runner.service' "$FAKE_MUTATION_LOG" && record_regression_failure 'pre-stage failed Qoral unit was reset'
+    [[ ! -s $FAKE_MUTATION_LOG ]] || record_regression_failure 'pre-stage failed Qoral refusal changed systemd state'
+fi
+
 : > "$FAKE_FAILED_UNITS"
 printf '%s\n' qa2-runner.service > "$FAKE_STOP_FAILED_UNITS"
 printf '%s\n' qa2-runner.service > "$FAKE_ACTIVE_UNITS"
@@ -481,6 +501,18 @@ else
     grep -Fxq kvm-dispatcher.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'ambiguous rollback stopped the dispatcher'
     grep -Fxq qa2-runner.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'ambiguous rollback stopped the legacy service'
     [[ ! -s $FAKE_MUTATION_LOG ]] || record_regression_failure 'ambiguous rollback changed systemd state'
+fi
+
+: > "$FAKE_ACTIVE_UNITS"
+printf '%s\n' kvm-dispatcher.service > "$FAKE_FAILED_UNITS"
+printf '%s\n' kvm-dispatcher.service > "$FAKE_ENABLED_UNITS"
+: > "$FAKE_MUTATION_LOG"
+if output=$(run_sourced_wizard rollback qa2 2>&1); then
+    record_regression_failure 'rollback accepted a dispatcher that was failed before its own stop'
+else
+    assert_contains "$output" 'active=failed'
+    grep -Fxq kvm-dispatcher.service "$FAKE_FAILED_UNITS" || record_regression_failure 'pre-stop failed dispatcher was cleared'
+    [[ ! -s $FAKE_MUTATION_LOG ]] || record_regression_failure 'pre-stop failed dispatcher refusal changed systemd state'
 fi
 
 cp "$ROOT_DIR/host/repos.d/qa2.conf.example" "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
