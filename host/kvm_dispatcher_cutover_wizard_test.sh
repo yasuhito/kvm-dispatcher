@@ -30,6 +30,16 @@ cat > "$TEST_BIN/systemctl" <<'FAKE_SYSTEMCTL'
 set -o errexit -o nounset -o pipefail
 command_name=${1:-}
 shift || true
+update_state() {
+    local state_file=$1 unit=$2 operation=$3 temporary
+    if [[ $operation == add ]]; then
+        grep -Fxq -- "$unit" "$state_file" || printf '%s\n' "$unit" >> "$state_file"
+    else
+        temporary="$state_file.tmp"
+        grep -Fxv -- "$unit" "$state_file" > "$temporary" || true
+        mv -- "$temporary" "$state_file"
+    fi
+}
 case $command_name in
     is-active|is-enabled)
         [[ ${1:-} == --quiet ]] && shift
@@ -48,25 +58,81 @@ case $command_name in
         fi
         ;;
     show)
-        property=
+        unit=${!#}
+        properties=()
+        value_only=0
         for arg in "$@"; do
             case $arg in
-                --property=*) property=${arg#--property=} ;;
+                --property=*) properties+=("${arg#--property=}") ;;
+                --value) value_only=1 ;;
             esac
         done
-        case $property in
-            ActiveEnterTimestamp) printf '%s\n' 'Sun 2026-10-25 04:00:00 UTC' ;;
+        printf '%s\n' "$unit" >> "$FAKE_SYSTEMCTL_SHOW_LOG"
+        if [[ $unit == *@.service ]]; then
+            printf 'Unit name %s is neither a valid invocation ID nor unit name.\n' "$unit" >&2
+            exit 1
+        fi
+        case $unit in
+            qa2-runner.service) value='Sun 2026-10-25 04:00:00 UTC' ;;
+            qa2-runner-job@*.service|qoral-runner-job@*.service)
+                for property in "${properties[@]}"; do
+                    case $property in
+                        Restart) value=no ;;
+                        MemoryAccounting) value=yes ;;
+                        LoadCredential) value='[unprintable]' ;;
+                        *) continue ;;
+                    esac
+                    if (( value_only == 1 )); then
+                        printf '%s\n' "$value"
+                    else
+                        printf '%s=%s\n' "$property" "$value"
+                    fi
+                done
+                ;;
             *) printf '\n' ;;
         esac
+        if [[ $unit == qa2-runner.service ]]; then
+            if (( value_only == 1 )); then printf '%s\n' "$value"; else printf 'ActiveEnterTimestamp=%s\n' "$value"; fi
+        fi
+        ;;
+    daemon-reload)
+        printf '%s\n' "$command_name" >> "$FAKE_MUTATION_LOG"
+        ;;
+    stop|disable|enable|start|restart)
+        unit=${1:-}
+        printf '%s %s\n' "$command_name" "$unit" >> "$FAKE_MUTATION_LOG"
+        case $command_name in
+            stop) update_state "$FAKE_ACTIVE_UNITS" "$unit" remove ;;
+            start|restart) update_state "$FAKE_ACTIVE_UNITS" "$unit" add ;;
+        esac
+        case $command_name in
+            disable) update_state "$FAKE_ENABLED_UNITS" "$unit" remove ;;
+            enable) update_state "$FAKE_ENABLED_UNITS" "$unit" add ;;
+        esac
+        if [[ $command_name == start && $unit == kvm-dispatcher.service ]]; then
+            now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            printf '{"updated_at":"%s","in_flight":[],"queued":[],"last_poll":{"qniapp/qa2":{"http":"200","at":"%s"}},"recent":[]}\n' \\
+                "$now" "$now" > "$FAKE_STATUS_FILE"
+        fi
         ;;
     list-units)
         pattern=${!#}
         while IFS= read -r unit; do
-            [[ -n $unit && $unit == $pattern ]] && printf '%s loaded active running test\n' "$unit"
+            if [[ -n $unit && $unit == $pattern ]]; then
+                printf '%s loaded active running test\n' "$unit"
+            fi
         done < "$FAKE_ACTIVE_UNITS"
         ;;
     cat)
-        printf '%s\n' '[Unit]' 'Description=Fake unit'
+        case ${1:-} in
+            qa2-runner-job@.service)
+                /usr/bin/cat "$FAKE_TEST_ROOT/etc/systemd/system/qa2-runner-job@.service"
+                ;;
+            qoral-runner-job@.service)
+                /usr/bin/cat "$FAKE_TEST_ROOT/etc/systemd/system/qoral-runner-job@.service"
+                ;;
+            *) printf '%s\n' '[Unit]' 'Description=Fake unit' ;;
+        esac
         ;;
     *)
         printf '%s %s\n' "$command_name" "$*" >> "$FAKE_MUTATION_LOG"
@@ -187,14 +253,42 @@ export FAKE_ENABLED_UNITS="$TMP_DIR/enabled-units"
 export FAKE_QA2_JOURNAL="$TMP_DIR/qa2-journal.log"
 export FAKE_DISPATCHER_JOURNAL="$TMP_DIR/dispatcher-journal.log"
 export FAKE_MUTATION_LOG="$TMP_DIR/mutations.log"
+export FAKE_STATUS_FILE="$TEST_ROOT/var/lib/kvm-dispatcher/status.json"
+export FAKE_SYSTEMCTL_SHOW_LOG="$TMP_DIR/systemctl-show.log"
+export FAKE_TEST_ROOT="$TEST_ROOT"
 : > "$FAKE_ACTIVE_UNITS"
 : > "$FAKE_ENABLED_UNITS"
 : > "$FAKE_DISPATCHER_JOURNAL"
 : > "$FAKE_MUTATION_LOG"
+: > "$FAKE_SYSTEMCTL_SHOW_LOG"
 
 WIZARD="$ROOT_DIR/host/kvm_dispatcher_cutover_wizard.sh"
+[[ $(command -v systemctl) == "$TEST_BIN/systemctl" ]] || fail 'the cutover test must use its fake systemctl'
 run_wizard() {
     (cd "$ROOT_DIR" && "$WIZARD" "$@") > "$TMP_DIR/wizard.out" 2>&1
+}
+run_sourced_wizard() {
+    local action=$1 target=$2
+    (
+        # shellcheck source=host/kvm_dispatcher_cutover_wizard.sh
+        source "$ROOT_DIR/host/kvm_dispatcher_cutover_wizard.sh"
+        export TEST_MODE=1
+        export INSTALL_ROOT=$TEST_ROOT
+        # shellcheck disable=SC2329
+        confirm_action() { return 0; }
+        # shellcheck disable=SC2329
+        confirm_idle() { return 0; }
+        # shellcheck disable=SC2329
+        confirm_legacy_ready() { return 0; }
+        # shellcheck disable=SC2329
+        systemctl_cmd() { command systemctl "$@"; }
+        case $action in
+            template) load_target "$target"; verify_template_properties ;;
+            stage) qa2_stage ;;
+            rollback) load_target "$target"; rollback_stage ;;
+            *) exit 2 ;;
+        esac
+    )
 }
 
 printf '%s\n' qa2-runner.service > "$FAKE_ACTIVE_UNITS"
@@ -240,6 +334,7 @@ assert_contains "$(<"$TMP_DIR/wizard.out")" '先にQoral rollbackを完了して
 [[ ! -s $FAKE_MUTATION_LOG ]] || fail 'QA2 rollback refusal issued a state-changing command'
 rm -f "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qoral.conf"
 
+cp "$QORAL_SOURCE/tools/kvm-runner/host/systemd/qoral-runner-job@.service" "$TMP_DIR/qoral-template"
 rm -f "$QORAL_SOURCE/tools/kvm-runner/host/systemd/qoral-runner-job@.service"
 git -C "$QORAL_SOURCE" add -A
 git -C "$QORAL_SOURCE" -c user.name='Cutover test' -c user.email='cutover@example.invalid' commit --amend -qm 'Remove test Qoral template'
@@ -252,4 +347,77 @@ assert_contains "$(<"$TMP_DIR/wizard.out")" 'Qoral の runner template が見つ
 [[ ! -e $TEST_ROOT/etc/systemd/system/qoral-runner-job@.service.d/10-isolation.conf ]] || fail 'Missing-template refusal installed an isolation drop-in'
 [[ ! -e $TEST_ROOT/etc/systemd/system/qoral-runner-job@.service.d/20-job-runtime.conf ]] || fail 'Missing-template refusal installed a runtime drop-in'
 
-printf 'PASS: cutover wizard refusal guards\n'
+REGRESSION_FAILURES=0
+record_regression_failure() {
+    printf 'FAIL: %s\n' "$*" >&2
+    REGRESSION_FAILURES=$((REGRESSION_FAILURES + 1))
+}
+mkdir -p "$TEST_ROOT/etc/systemd/system/qa2-runner-job@.service.d"
+cp "$QA2_SOURCE/Tools/KvmRunner/host/systemd/qa2-runner-job@.service" \
+    "$TEST_ROOT/etc/systemd/system/qa2-runner-job@.service"
+cp "$QA2_SOURCE/Tools/KvmRunner/host/systemd/qa2-runner-isolation.conf" \
+    "$TEST_ROOT/etc/systemd/system/qa2-runner-job@.service.d/10-isolation.conf"
+cp "$ROOT_DIR/host/systemd/examples/qa2-runner-job@.service.d/20-job-runtime.conf" \
+    "$TEST_ROOT/etc/systemd/system/qa2-runner-job@.service.d/20-job-runtime.conf"
+cp "$ROOT_DIR/host/repos.d/qa2.conf.example" "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+chmod 644 "$TEST_ROOT/etc/systemd/system/qa2-runner-job@.service" \
+    "$TEST_ROOT/etc/systemd/system/qa2-runner-job@.service.d/10-isolation.conf" \
+    "$TEST_ROOT/etc/systemd/system/qa2-runner-job@.service.d/20-job-runtime.conf"
+chmod 640 "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+mkdir -p "$TEST_ROOT/etc/systemd/system"
+cp "$TMP_DIR/qoral-template" "$TEST_ROOT/etc/systemd/system/qoral-runner-job@.service"
+chmod 644 "$TEST_ROOT/etc/systemd/system/qoral-runner-job@.service"
+for target in qa2 qoral; do
+    if output=$(run_sourced_wizard template "$target" 2>&1); then
+        printf 'PASS: %s template properties use a valid instance\n' "$target"
+    else
+        record_regression_failure "$target template properties query failed: $output"
+    fi
+done
+printf '%s\n' qa2-runner.service > "$FAKE_ACTIVE_UNITS"
+printf '%s\n' qa2-runner.service > "$FAKE_ENABLED_UNITS"
+printf '%s\n' 'job=1001 event=runner-online after=12s' > "$FAKE_QA2_JOURNAL"
+: > "$FAKE_MUTATION_LOG"
+if output=$(run_sourced_wizard stage qa2 2>&1); then
+    assert_contains "$output" '同じfileがあるため配置を省略します'
+    assert_contains "$output" 'QA2 stageが完了しました'
+    grep -Fxq kvm-dispatcher.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'QA2 rerun did not start the dispatcher'
+    grep -Fxq kvm-dispatcher.service "$FAKE_ENABLED_UNITS" || record_regression_failure 'QA2 rerun did not enable the dispatcher'
+    grep -Fxq qa2-runner.service "$FAKE_ACTIVE_UNITS" && record_regression_failure 'QA2 rerun left the legacy service active'
+    grep -Fxq qa2-runner.service "$FAKE_ENABLED_UNITS" && record_regression_failure 'QA2 rerun left the legacy service enabled'
+else
+    record_regression_failure "QA2 stage did not resume from identical installed files: $output"
+fi
+
+cp "$ROOT_DIR/host/repos.d/qa2.conf.example" "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+chmod 640 "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+printf '%s\n' qa2-runner.service > "$FAKE_ACTIVE_UNITS"
+printf '%s\n' qa2-runner.service > "$FAKE_ENABLED_UNITS"
+: > "$FAKE_MUTATION_LOG"
+if output=$(run_sourced_wizard rollback qa2 2>&1); then
+    assert_contains "$output" 'rollbackが完了しました'
+    [[ ! -e $TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf ]] || record_regression_failure 'safe QA2 rollback kept the adapter'
+    grep -Fxq qa2-runner.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'safe QA2 rollback stopped the legacy service'
+    grep -Fxq qa2-runner.service "$FAKE_ENABLED_UNITS" || record_regression_failure 'safe QA2 rollback disabled the legacy service'
+    [[ ! -s $FAKE_MUTATION_LOG ]] || record_regression_failure 'safe QA2 rollback changed systemd state'
+else
+    record_regression_failure "safe QA2 rollback refused the installed-adapter state: $output"
+fi
+
+cp "$ROOT_DIR/host/repos.d/qa2.conf.example" "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+chmod 640 "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+printf '%s\n' kvm-dispatcher.service qa2-runner.service > "$FAKE_ACTIVE_UNITS"
+printf '%s\n' kvm-dispatcher.service qa2-runner.service > "$FAKE_ENABLED_UNITS"
+: > "$FAKE_MUTATION_LOG"
+if output=$(run_sourced_wizard rollback qa2 2>&1); then
+    record_regression_failure 'ambiguous rollback accepted active dispatcher and legacy services'
+else
+    assert_contains "$output" '状態を調査するまでrollbackしません'
+    [[ -e $TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf ]] || record_regression_failure 'ambiguous rollback removed the adapter'
+    grep -Fxq kvm-dispatcher.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'ambiguous rollback stopped the dispatcher'
+    grep -Fxq qa2-runner.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'ambiguous rollback stopped the legacy service'
+    [[ ! -s $FAKE_MUTATION_LOG ]] || record_regression_failure 'ambiguous rollback changed systemd state'
+fi
+
+(( REGRESSION_FAILURES == 0 )) || fail "$REGRESSION_FAILURES cutover regressions failed"
+printf 'PASS: cutover wizard refusal and recovery guards\n'

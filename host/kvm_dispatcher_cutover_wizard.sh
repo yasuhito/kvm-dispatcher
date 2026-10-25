@@ -1219,6 +1219,8 @@ select_menu() {
     esac
 }
 
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+
 if [[ -n ${KVM_DISPATCHER_CUTOVER_TEST_ROOT:-} ]]; then
     if [[ ${KVM_DISPATCHER_CUTOVER_TESTING:-} != 1 || $KVM_DISPATCHER_CUTOVER_TEST_ROOT != /* ]]; then
         fail 'テスト用rootはテストscriptからのみ指定できます。'
