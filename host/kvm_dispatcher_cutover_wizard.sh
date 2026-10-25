@@ -636,15 +636,20 @@ run_systemctl_action() {
 }
 
 verify_template_properties() {
-    local output restart memory credential
-    output=$(systemctl_cmd show --property=Restart --property=MemoryAccounting --property=LoadCredential "$TEMPLATE_UNIT" 2>/dev/null) || {
+    local output template instance restart memory
+    instance="${UNIT_PREFIX}cutover-check.service"
+    output=$(systemctl_cmd show --property=Restart --property=MemoryAccounting "$instance" 2>/dev/null) || {
+        fail "systemdがtemplateの設定を読み込めません: $TEMPLATE_UNIT"
+        return 1
+    }
+    template=$(systemctl_cmd cat "$TEMPLATE_UNIT" 2>/dev/null) || {
         fail "systemdがtemplateの設定を読み込めません: $TEMPLATE_UNIT"
         return 1
     }
     restart=$(awk -F= '$1 == "Restart" { print $2 }' <<< "$output")
     memory=$(awk -F= '$1 == "MemoryAccounting" { print $2 }' <<< "$output")
-    credential=$(awk -F= '$1 == "LoadCredential" { print $2 }' <<< "$output")
-    if [[ $restart != no || $memory != yes || $credential != 'github-token:/run/kvm-dispatcher/jobs/%i/github-token' ]]; then
+    if [[ $restart != no || $memory != yes ]] ||
+        ! grep -Fxq -- 'LoadCredential=github-token:/run/kvm-dispatcher/jobs/%i/github-token' <<< "$template"; then
         fail "$TEMPLATE_UNIT のRestart、MemoryAccounting、LoadCredentialが想定と異なります。"
         return 1
     fi
@@ -1014,7 +1019,8 @@ check_rollback_topology() {
         fail "配車係のservice状態を確認できません。active=$active enabled=$enabled"
         return 1
     fi
-    if [[ -e $adapter_path && $legacy_active == active ]]; then
+    if [[ -e $adapter_path && $legacy_active == active &&
+        ( $active != inactive || $enabled != disabled ) ]]; then
         fail "$LEGACY_UNITと対象adapterが同時に有効です。状態を調査するまでrollbackしません。"
         return 1
     fi

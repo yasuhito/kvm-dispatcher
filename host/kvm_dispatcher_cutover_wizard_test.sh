@@ -111,8 +111,7 @@ case $command_name in
         esac
         if [[ $command_name == start && $unit == kvm-dispatcher.service ]]; then
             now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-            printf '{"updated_at":"%s","in_flight":[],"queued":[],"last_poll":{"qniapp/qa2":{"http":"200","at":"%s"}},"recent":[]}\n' \\
-                "$now" "$now" > "$FAKE_STATUS_FILE"
+            printf '{"updated_at":"%s","in_flight":[],"queued":[],"last_poll":{"qniapp/qa2":{"http":"200","at":"%s"}},"recent":[]}\n' "$now" "$now" > "$FAKE_STATUS_FILE"
         fi
         ;;
     list-units)
