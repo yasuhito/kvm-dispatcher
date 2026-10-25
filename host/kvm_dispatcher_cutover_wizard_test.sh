@@ -49,6 +49,9 @@ case $command_name in
         esac
         if grep -Fxq -- "${1:-}" "$state_file"; then
             printf '%s\n' "$expected"
+        elif [[ $command_name == is-active ]] && grep -Fxq -- "${1:-}" "$FAKE_FAILED_UNITS"; then
+            printf 'failed\n'
+            exit 1
         else
             case ${1:-} in
                 kvm-dispatcher.service|qa2-runner.service|qoral-runner.service) printf '%s\n' "$fallback" ;;
@@ -72,38 +75,63 @@ case $command_name in
             printf 'Unit name %s is neither a valid invocation ID nor unit name.\n' "$unit" >&2
             exit 1
         fi
-        case $unit in
-            qa2-runner.service) value='Sun 2026-10-25 04:00:00 UTC' ;;
-            qa2-runner-job@*.service|qoral-runner-job@*.service)
-                for property in "${properties[@]}"; do
-                    case $property in
-                        Restart) value=no ;;
-                        MemoryAccounting) value=yes ;;
-                        LoadCredential) value='[unprintable]' ;;
-                        *) continue ;;
-                    esac
-                    if (( value_only == 1 )); then
-                        printf '%s\n' "$value"
-                    else
-                        printf '%s=%s\n' "$property" "$value"
-                    fi
-                done
-                ;;
-            *) printf '\n' ;;
-        esac
-        if [[ $unit == qa2-runner.service ]]; then
-            if (( value_only == 1 )); then printf '%s\n' "$value"; else printf 'ActiveEnterTimestamp=%s\n' "$value"; fi
-        fi
+        for property in "${properties[@]}"; do
+            case $property in
+                ActiveEnterTimestamp)
+                    [[ $unit == qa2-runner.service ]] || continue
+                    value='Sun 2026-10-25 04:00:00 UTC'
+                    ;;
+                Restart)
+                    [[ $unit == *@*.service ]] || continue
+                    value=no
+                    ;;
+                MemoryAccounting)
+                    [[ $unit == *@*.service ]] || continue
+                    value=yes
+                    ;;
+                LoadCredential)
+                    [[ $unit == *@*.service ]] || continue
+                    value='[unprintable]'
+                    ;;
+                Result)
+                    if grep -Fxq -- "$unit" "$FAKE_FAILED_UNITS"; then value=exit-code; else value=success; fi
+                    ;;
+                ExecMainStatus)
+                    if grep -Fxq -- "$unit" "$FAKE_FAILED_UNITS"; then value=143; else value=0; fi
+                    ;;
+                *) continue ;;
+            esac
+            if (( value_only == 1 )); then
+                printf '%s\n' "$value"
+            else
+                printf '%s=%s\n' "$property" "$value"
+            fi
+        done
         ;;
     daemon-reload)
         printf '%s\n' "$command_name" >> "$FAKE_MUTATION_LOG"
+        ;;
+    reset-failed)
+        unit=${1:-}
+        printf '%s %s\n' "$command_name" "$unit" >> "$FAKE_MUTATION_LOG"
+        update_state "$FAKE_FAILED_UNITS" "$unit" remove
         ;;
     stop|disable|enable|start|restart)
         unit=${1:-}
         printf '%s %s\n' "$command_name" "$unit" >> "$FAKE_MUTATION_LOG"
         case $command_name in
-            stop) update_state "$FAKE_ACTIVE_UNITS" "$unit" remove ;;
-            start|restart) update_state "$FAKE_ACTIVE_UNITS" "$unit" add ;;
+            stop)
+                update_state "$FAKE_ACTIVE_UNITS" "$unit" remove
+                if grep -Fxq -- "$unit" "$FAKE_STOP_FAILED_UNITS"; then
+                    update_state "$FAKE_FAILED_UNITS" "$unit" add
+                else
+                    update_state "$FAKE_FAILED_UNITS" "$unit" remove
+                fi
+                ;;
+            start|restart)
+                update_state "$FAKE_ACTIVE_UNITS" "$unit" add
+                update_state "$FAKE_FAILED_UNITS" "$unit" remove
+                ;;
         esac
         case $command_name in
             disable) update_state "$FAKE_ENABLED_UNITS" "$unit" remove ;;
@@ -249,6 +277,9 @@ export KVM_DISPATCHER_CUTOVER_QA2_SOURCE="$QA2_SOURCE"
 export KVM_DISPATCHER_CUTOVER_QORAL_SOURCE="$QORAL_SOURCE"
 export FAKE_ACTIVE_UNITS="$TMP_DIR/active-units"
 export FAKE_ENABLED_UNITS="$TMP_DIR/enabled-units"
+export FAKE_FAILED_UNITS="$TMP_DIR/failed-units"
+export FAKE_STOP_FAILED_UNITS="$TMP_DIR/stop-failed-units"
+export FAKE_CONFIRMATION_LOG="$TMP_DIR/confirmations.log"
 export FAKE_QA2_JOURNAL="$TMP_DIR/qa2-journal.log"
 export FAKE_DISPATCHER_JOURNAL="$TMP_DIR/dispatcher-journal.log"
 export FAKE_MUTATION_LOG="$TMP_DIR/mutations.log"
@@ -257,6 +288,9 @@ export FAKE_SYSTEMCTL_SHOW_LOG="$TMP_DIR/systemctl-show.log"
 export FAKE_TEST_ROOT="$TEST_ROOT"
 : > "$FAKE_ACTIVE_UNITS"
 : > "$FAKE_ENABLED_UNITS"
+: > "$FAKE_FAILED_UNITS"
+: > "$FAKE_STOP_FAILED_UNITS"
+: > "$FAKE_CONFIRMATION_LOG"
 : > "$FAKE_DISPATCHER_JOURNAL"
 : > "$FAKE_MUTATION_LOG"
 : > "$FAKE_SYSTEMCTL_SHOW_LOG"
@@ -274,11 +308,16 @@ run_sourced_wizard() {
         export TEST_MODE=1
         export INSTALL_ROOT=$TEST_ROOT
         # shellcheck disable=SC2329
-        confirm_action() { return 0; }
+        confirm_action() { printf '%s\n' "$1" >> "$FAKE_CONFIRMATION_LOG"; return 0; }
         # shellcheck disable=SC2329
         confirm_idle() { return 0; }
         # shellcheck disable=SC2329
         confirm_legacy_ready() { return 0; }
+        # shellcheck disable=SC2329
+        place_file() {
+            local source=$1 destination=$2 mode=$3
+            install -D --mode="$mode" -- "$source" "$destination"
+        }
         # shellcheck disable=SC2329
         systemctl_cmd() { command systemctl "$@"; }
         case $action in
@@ -373,19 +412,45 @@ for target in qa2 qoral; do
         record_regression_failure "$target template properties query failed: $output"
     fi
 done
+rm -f -- "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+printf '%s\n' qa2-runner.service > "$FAKE_FAILED_UNITS"
+printf '%s\n' qa2-runner.service > "$FAKE_ENABLED_UNITS"
+: > "$FAKE_ACTIVE_UNITS"
+: > "$FAKE_MUTATION_LOG"
+: > "$FAKE_CONFIRMATION_LOG"
+if output=$(run_sourced_wizard stage qa2 2>&1); then
+    record_regression_failure 'QA2 stage accepted a legacy service that was already failed before stop'
+else
+    assert_contains "$output" 'active=failed'
+    grep -Fxq qa2-runner.service "$FAKE_FAILED_UNITS" || record_regression_failure 'pre-stop failed QA2 unit was cleared'
+    grep -Fq 'reset-failed qa2-runner.service' "$FAKE_MUTATION_LOG" && record_regression_failure 'pre-stop failed QA2 unit was reset'
+    [[ ! -s $FAKE_MUTATION_LOG ]] || record_regression_failure 'pre-stop failed QA2 refusal changed systemd state'
+fi
+
+: > "$FAKE_FAILED_UNITS"
+printf '%s\n' qa2-runner.service > "$FAKE_STOP_FAILED_UNITS"
 printf '%s\n' qa2-runner.service > "$FAKE_ACTIVE_UNITS"
 printf '%s\n' qa2-runner.service > "$FAKE_ENABLED_UNITS"
 printf '%s\n' 'job=1001 event=runner-online after=12s' > "$FAKE_QA2_JOURNAL"
 : > "$FAKE_MUTATION_LOG"
+: > "$FAKE_CONFIRMATION_LOG"
 if output=$(run_sourced_wizard stage qa2 2>&1); then
     assert_contains "$output" '同じfileがあるため配置を省略します'
+    assert_contains "$output" 'Result=exit-code'
+    assert_contains "$output" 'ExecMainStatus=143'
+    assert_contains "$output" '停止後にsystemdがfailedを報告しました'
     assert_contains "$output" 'QA2 stageが完了しました'
+    grep -Fq 'reset-failed qa2-runner.service' "$FAKE_CONFIRMATION_LOG" || record_regression_failure 'QA2 reset-failed was not confirmed'
+    grep -Fxq 'reset-failed qa2-runner.service' "$FAKE_MUTATION_LOG" || record_regression_failure 'QA2 failed state was not reset'
     grep -Fxq kvm-dispatcher.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'QA2 rerun did not start the dispatcher'
     grep -Fxq kvm-dispatcher.service "$FAKE_ENABLED_UNITS" || record_regression_failure 'QA2 rerun did not enable the dispatcher'
     grep -Fxq qa2-runner.service "$FAKE_ACTIVE_UNITS" && record_regression_failure 'QA2 rerun left the legacy service active'
     grep -Fxq qa2-runner.service "$FAKE_ENABLED_UNITS" && record_regression_failure 'QA2 rerun left the legacy service enabled'
+    grep -Fxq qa2-runner.service "$FAKE_FAILED_UNITS" && record_regression_failure 'QA2 rerun left the legacy service failed'
+    [[ -f $TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf && ! -L $TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf ]] || record_regression_failure 'QA2 rerun did not reinstall the missing adapter'
+    cmp -s "$ROOT_DIR/host/repos.d/qa2.conf.example" "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf" || record_regression_failure 'QA2 rerun installed the wrong adapter contents'
 else
-    record_regression_failure "QA2 stage did not resume from identical installed files: $output"
+    record_regression_failure "QA2 stage did not resume from installed templates and a missing adapter: $output"
 fi
 
 cp "$ROOT_DIR/host/repos.d/qa2.conf.example" "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
@@ -416,6 +481,32 @@ else
     grep -Fxq kvm-dispatcher.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'ambiguous rollback stopped the dispatcher'
     grep -Fxq qa2-runner.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'ambiguous rollback stopped the legacy service'
     [[ ! -s $FAKE_MUTATION_LOG ]] || record_regression_failure 'ambiguous rollback changed systemd state'
+fi
+
+cp "$ROOT_DIR/host/repos.d/qa2.conf.example" "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+chmod 640 "$TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf"
+printf '%s\n' qa2-runner.service > "$FAKE_ACTIVE_UNITS"
+printf '%s\n' qa2-runner.service > "$FAKE_ENABLED_UNITS"
+printf '%s\n' kvm-dispatcher.service qa2-runner-job@1001.service qoral-runner-job@2002.service > "$FAKE_ACTIVE_UNITS"
+printf '%s\n' kvm-dispatcher.service > "$FAKE_ENABLED_UNITS"
+printf '%s\n' kvm-dispatcher.service qa2-runner-job@1001.service qoral-runner-job@2002.service > "$FAKE_STOP_FAILED_UNITS"
+: > "$FAKE_FAILED_UNITS"
+: > "$FAKE_MUTATION_LOG"
+: > "$FAKE_CONFIRMATION_LOG"
+if output=$(run_sourced_wizard rollback qa2 2>&1); then
+    assert_contains "$output" 'rollbackが完了しました'
+    for unit in kvm-dispatcher.service qa2-runner-job@1001.service qoral-runner-job@2002.service; do
+        grep -Fq "reset-failed $unit" "$FAKE_CONFIRMATION_LOG" || record_regression_failure "$unit reset-failed was not confirmed during rollback"
+        grep -Fxq "reset-failed $unit" "$FAKE_MUTATION_LOG" || record_regression_failure "$unit failed state was not reset during rollback"
+    done
+    [[ ! -s $FAKE_FAILED_UNITS ]] || record_regression_failure 'rollback left stopped units failed'
+    [[ ! -e $TEST_ROOT/etc/kvm-dispatcher/repos.d/qa2.conf ]] || record_regression_failure 'rollback with failed stop results kept the adapter'
+    grep -Fxq qa2-runner.service "$FAKE_ACTIVE_UNITS" || record_regression_failure 'rollback with failed stop results did not start the legacy service'
+    grep -Fxq qa2-runner.service "$FAKE_ENABLED_UNITS" || record_regression_failure 'rollback with failed stop results did not enable the legacy service'
+    grep -Fxq kvm-dispatcher.service "$FAKE_ACTIVE_UNITS" && record_regression_failure 'rollback left the dispatcher active'
+    grep -Fxq kvm-dispatcher.service "$FAKE_ENABLED_UNITS" && record_regression_failure 'rollback left the dispatcher enabled'
+else
+    record_regression_failure "rollback did not recover from failed stop results: $output"
 fi
 
 (( REGRESSION_FAILURES == 0 )) || fail "$REGRESSION_FAILURES cutover regressions failed"
