@@ -332,9 +332,9 @@ kvd_adapter_labels_json() {
 }
 
 kvd_labels_match() {
-    local adapter=$1 job_json=$2 required
-    required=$(kvd_adapter_labels_json "$adapter")
-    jq -e --argjson required "$required" '[.labels[]?] as $available | all($required[]; . as $label | $available | index($label) != null)' <<< "$job_json" >/dev/null
+    local adapter=$1 job_json=$2 adapter_labels
+    adapter_labels=$(kvd_adapter_labels_json "$adapter")
+    jq -e --argjson adapter_labels "$adapter_labels" '[.labels[]?] as $job_labels | all($job_labels[]; . as $label | $adapter_labels | index($label) != null)' <<< "$job_json" >/dev/null
 }
 
 kvd_record_poll() {

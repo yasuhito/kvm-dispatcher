@@ -341,8 +341,8 @@ assert_contains "$(<"$FAKE_ARGV_LOG")" '/repos/qniapp/qa2/actions/runners?per_pa
 assert_contains "$(<"$FAKE_ARGV_LOG")" '/repos/qorraq/qoral/actions/runners?per_page=100'
 [[ $(jq '.last_poll | length' "$TMP_DIR/status/status.json") -eq 2 ]] || fail 'empty-adapter installation probe was incomplete'
 
-# Queued and pending runs are both scanned. The oldest pending Qoral job wins FIFO;
-# capacity=12 GiB then holds the QA2 job until the slot is free.
+# A Qoral job requesting unsupported labels stays unstarted, so the exact-label QA2
+# job can use the single 12 GiB slot.
 clear_fixtures
 set_runs qniapp_qa2 queued '[{"id":101}]'
 set_jobs qniapp_qa2 101 '[{"id":1001,"status":"queued","created_at":"2026-01-01T00:00:10Z","labels":["qa2-kvm"]}]'
@@ -352,7 +352,7 @@ run_dispatcher
 [[ $(<"$FAKE_START_LOG") == *'qa2-runner-job@1001.service'* ]] || fail "exact-label QA2 job did not start; started: $(<"$FAKE_START_LOG")"
 [[ $(<"$FAKE_START_LOG") != *'qoral-runner-job@2001.service'* ]] || fail 'dispatcher started a job requiring labels absent from its adapter'
 [[ $(wc -l < "$FAKE_START_LOG") -eq 1 ]] || fail 'capacity semaphore started more than one 12 GiB job'
-[[ $(jq '.queued | length' "$TMP_DIR/status/status.json") -eq 1 ]] || fail 'queued status did not separate the in-flight job from waiting jobs'
+[[ $(jq '.queued | length' "$TMP_DIR/status/status.json") -eq 0 ]] || fail 'unrunnable job was reported as schedulable'
 [[ $(jq '.in_flight | length' "$TMP_DIR/status/status.json") -eq 1 ]] || fail 'status did not include the running job'
 jq -e 'keys == ["blocked","capacity_mib","in_flight","last_poll","queued","recent","updated_at"] and .capacity_mib == 12288 and (.in_flight|type == "array") and (.queued|type == "array") and (.last_poll|type == "object") and (.blocked|type == "array") and .recent == []' "$TMP_DIR/status/status.json" >/dev/null || fail 'status.json shape is incorrect'
 
