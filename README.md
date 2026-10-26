@@ -19,7 +19,7 @@ Runtime secrets and job state live under `/run/kvm-dispatcher`. The service sets
 
 ## Scheduling and lifecycle
 
-For each configured repository, one poll requests workflow runs in `queued`, `pending`, and `in_progress` status, then reads their jobs. A queued job is eligible only when it contains every adapter label. Run and job pagination uses 100-item pages. Candidate jobs are ordered by `created_at` across repositories. The dispatcher starts the next eligible job only when both its repository concurrency cap and the total `KVM_DISPATCHER_CAPACITY_MIB` allow it.
+For each configured repository, one poll requests workflow runs in `queued`, `pending`, and `in_progress` status, then reads their jobs. A queued job is eligible only when every requested label is present in its adapter's `KVM_DISPATCHER_LABELS`. Run and job pagination uses 100-item pages. Candidate jobs are ordered by `created_at` across repositories. The dispatcher starts the next eligible job only when both its repository concurrency cap and the total `KVM_DISPATCHER_CAPACITY_MIB` allow it.
 
 `KVM_DISPATCHER_PRIORITY` is empty by default, which gives global FIFO. Setting it to an adapter name such as `qa2` serves that adapter's queued jobs first while it has work; jobs within each adapter retain FIFO order. Remove the setting to return to global FIFO.
 
