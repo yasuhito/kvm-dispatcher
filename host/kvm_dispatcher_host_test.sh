@@ -349,7 +349,8 @@ set_jobs qniapp_qa2 101 '[{"id":1001,"status":"queued","created_at":"2026-01-01T
 set_runs qorraq_qoral pending '[{"id":201}]'
 set_jobs qorraq_qoral 201 '[{"id":2001,"status":"queued","created_at":"2026-01-01T00:00:01Z","labels":["self-hosted","linux","x64","qoral-kvm"]}]'
 run_dispatcher
-assert_contains "$(<"$FAKE_START_LOG")" 'qoral-runner-job@2001.service'
+[[ $(<"$FAKE_START_LOG") == *'qa2-runner-job@1001.service'* ]] || fail "exact-label QA2 job did not start; started: $(<"$FAKE_START_LOG")"
+[[ $(<"$FAKE_START_LOG") != *'qoral-runner-job@2001.service'* ]] || fail 'dispatcher started a job requiring labels absent from its adapter'
 [[ $(wc -l < "$FAKE_START_LOG") -eq 1 ]] || fail 'capacity semaphore started more than one 12 GiB job'
 [[ $(jq '.queued | length' "$TMP_DIR/status/status.json") -eq 1 ]] || fail 'queued status did not separate the in-flight job from waiting jobs'
 [[ $(jq '.in_flight | length' "$TMP_DIR/status/status.json") -eq 1 ]] || fail 'status did not include the running job'
